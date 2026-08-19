@@ -1,0 +1,334 @@
+import { config } from './config';
+
+/**
+ * Storage for this service, over the Supabase REST API of the shared project.
+ *
+ * We read public.group_cases (owned by the sibling services -- read only from
+ * here) and own public.project_setups (sql/001_project_setup.sql). The service
+ * key bypasses row-level security. Rows come back snake_case; everything above
+ * this module works in camelCase with real Dates, so the mapping lives here.
+ */
+
+export class DbError extends Error {
+  status: number;
+  details: unknown;
+
+  constructor(message: string, status: number, details: unknown) {
+    super(message);
+    this.name = 'DbError';
+    this.status = status;
+    this.details = details;
+  }
+}
+
+async function call<T>(
+  method: 'GET' | 'POST' | 'PATCH',
+  pathname: string,
+  init: { body?: unknown; prefer?: string } = {}
+): Promise<T> {
+  const res = await fetch(`${config.supabase.url}/rest/v1${pathname}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: config.supabase.serviceKey,
+      authorization: `Bearer ${config.supabase.serviceKey}`,
+      ...(init.prefer ? { Prefer: init.prefer } : {}),
+    },
+    body: init.body === undefined ? undefined : JSON.stringify(init.body),
+  });
+
+  const text = await res.text();
+  let data: unknown;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!res.ok) {
+    throw new DbError(
+      `Supabase ${method} ${pathname.split('?')[0]} returned ${res.status}: ${text.slice(0, 500)}`,
+      res.status,
+      data
+    );
+  }
+
+  return data as T;
+}
+
+// ---------------------------------------------------------------------------
+// group_cases (read only) -- just the columns Stage 5 needs.
+
+export type CaseStage = 'NEW' | 'IN_PROGRESS' | 'MENTOR_ASSIGNED' | 'ABANDONED';
+
+export interface GroupCase {
+  id: string;
+  chatId: string;
+  groupName: string;
+  studentName: string;
+  studentPhone: string | null;
+  studentEmail: string | null;
+  parentName: string | null;
+  parentPhone: string | null;
+  parentEmail: string | null;
+  projectName: string | null;
+  stage: CaseStage;
+  mentorName: string | null;
+}
+
+interface GroupCaseRow {
+  id: string;
+  chat_id: string;
+  group_name: string;
+  student_name: string;
+  student_phone: string | null;
+  student_email: string | null;
+  parent_name: string | null;
+  parent_phone: string | null;
+  parent_email: string | null;
+  project_name: string | null;
+  stage: CaseStage;
+  mentor_name: string | null;
+}
+
+const CASE_COLUMNS =
+  'id,chat_id,group_name,student_name,student_phone,student_email,parent_name,parent_phone,parent_email,project_name,stage,mentor_name';
+
+function toCase(row: GroupCaseRow): GroupCase {
+  return {
+    id: row.id,
+    chatId: row.chat_id,
+    groupName: row.group_name,
+    studentName: row.student_name,
+    studentPhone: row.student_phone,
+    studentEmail: row.student_email,
+    parentName: row.parent_name,
+    parentPhone: row.parent_phone,
+    parentEmail: row.parent_email,
+    projectName: row.project_name,
+    stage: row.stage,
+    mentorName: row.mentor_name,
+  };
+}
+
+export async function findCaseById(id: string): Promise<GroupCase | null> {
+  const params = new URLSearchParams({
+    select: CASE_COLUMNS,
+    id: `eq.${id}`,
+    limit: '1',
+  });
+  const rows = await call<GroupCaseRow[]>('GET', `/group_cases?${params}`);
+  return rows[0] ? toCase(rows[0]) : null;
+}
+
+// ---------------------------------------------------------------------------
+// project_setups (read/write) -- this service's state.
+
+export type SetupStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED';
+export type StepStatus = 'PENDING' | 'OK' | 'FAILED' | 'SKIPPED';
+
+export interface ProjectSetup {
+  caseId: string;
+  projectTitle: string | null;
+  projectDescription: string | null;
+  curriculumSubject: string | null;
+  submittedAt: Date | null;
+  submittedBy: string | null;
+  status: SetupStatus;
+  stepWhatsapp: StepStatus;
+  stepSync: StepStatus;
+  stepDrive: StepStatus;
+  stepCurriculum: StepStatus;
+  stepCosmicStudent: StepStatus;
+  stepCosmicProject: StepStatus;
+  stepCosmicSyncGroup: StepStatus;
+  driveFolderId: string | null;
+  driveFolderUrl: string | null;
+  cosmicStudentId: string | null;
+  cosmicUserId: string | null;
+  cosmicProjectId: string | null;
+  attempts: number;
+  lastError: string | null;
+  lastRunAt: Date | null;
+  completedAt: Date | null;
+}
+
+interface ProjectSetupRow {
+  case_id: string;
+  project_title: string | null;
+  project_description: string | null;
+  curriculum_subject: string | null;
+  submitted_at: string | null;
+  submitted_by: string | null;
+  status: SetupStatus;
+  step_whatsapp: StepStatus;
+  step_sync: StepStatus;
+  step_drive: StepStatus;
+  step_curriculum: StepStatus;
+  step_cosmic_student: StepStatus;
+  step_cosmic_project: StepStatus;
+  step_cosmic_sync_group: StepStatus;
+  drive_folder_id: string | null;
+  drive_folder_url: string | null;
+  cosmic_student_id: string | null;
+  cosmic_user_id: string | null;
+  cosmic_project_id: string | null;
+  attempts: number;
+  last_error: string | null;
+  last_run_at: string | null;
+  completed_at: string | null;
+}
+
+const date = (v: string | null): Date | null => (v === null ? null : new Date(v));
+
+function toSetup(row: ProjectSetupRow): ProjectSetup {
+  return {
+    caseId: row.case_id,
+    projectTitle: row.project_title,
+    projectDescription: row.project_description,
+    curriculumSubject: row.curriculum_subject,
+    submittedAt: date(row.submitted_at),
+    submittedBy: row.submitted_by,
+    status: row.status,
+    stepWhatsapp: row.step_whatsapp,
+    stepSync: row.step_sync,
+    stepDrive: row.step_drive,
+    stepCurriculum: row.step_curriculum,
+    stepCosmicStudent: row.step_cosmic_student,
+    stepCosmicProject: row.step_cosmic_project,
+    stepCosmicSyncGroup: row.step_cosmic_sync_group,
+    driveFolderId: row.drive_folder_id,
+    driveFolderUrl: row.drive_folder_url,
+    cosmicStudentId: row.cosmic_student_id,
+    cosmicUserId: row.cosmic_user_id,
+    cosmicProjectId: row.cosmic_project_id,
+    attempts: row.attempts,
+    lastError: row.last_error,
+    lastRunAt: date(row.last_run_at),
+    completedAt: date(row.completed_at),
+  };
+}
+
+export async function findSetup(caseId: string): Promise<ProjectSetup | null> {
+  const params = new URLSearchParams({
+    select: '*',
+    case_id: `eq.${caseId}`,
+    limit: '1',
+  });
+  const rows = await call<ProjectSetupRow[]>('GET', `/project_setups?${params}`);
+  return rows[0] ? toSetup(rows[0]) : null;
+}
+
+/**
+ * Cases the cron should run: their project details were submitted in the
+ * dashboard, they are not already done, and the parent case has a mentor
+ * assigned. The join to group_cases keeps a submitted-but-mentorless case out
+ * of the working set. maxAttempts (when non-zero) drops cases that have failed
+ * too many times.
+ *
+ * PostgREST embeds the parent row with `group_cases!inner(...)`, and the
+ * `stage=eq` filter on the embedded resource makes the inner join selective.
+ */
+export async function listRunnable(maxAttempts: number): Promise<ProjectSetup[]> {
+  const params = new URLSearchParams();
+  params.set('select', '*,group_cases!inner(stage)');
+  params.set('submitted_at', 'not.is.null');
+  params.set('status', 'in.(PENDING,FAILED)');
+  params.set('group_cases.stage', 'eq.MENTOR_ASSIGNED');
+  if (maxAttempts > 0) params.set('attempts', `lt.${maxAttempts}`);
+  params.set('order', 'submitted_at.asc');
+
+  const rows = await call<ProjectSetupRow[]>('GET', `/project_setups?${params}`);
+  return rows.map(toSetup);
+}
+
+export interface SetupPatch {
+  status?: SetupStatus;
+  stepWhatsapp?: StepStatus;
+  stepSync?: StepStatus;
+  stepDrive?: StepStatus;
+  stepCurriculum?: StepStatus;
+  stepCosmicStudent?: StepStatus;
+  stepCosmicProject?: StepStatus;
+  stepCosmicSyncGroup?: StepStatus;
+  driveFolderId?: string | null;
+  driveFolderUrl?: string | null;
+  cosmicStudentId?: string | null;
+  cosmicUserId?: string | null;
+  cosmicProjectId?: string | null;
+  attempts?: number;
+  lastError?: string | null;
+  lastRunAt?: Date | null;
+  completedAt?: Date | null;
+}
+
+export async function updateSetup(
+  caseId: string,
+  patch: SetupPatch
+): Promise<ProjectSetup> {
+  const body: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  const set = (column: string, value: unknown) => {
+    if (value !== undefined) {
+      body[column] = value instanceof Date ? value.toISOString() : value;
+    }
+  };
+
+  set('status', patch.status);
+  set('step_whatsapp', patch.stepWhatsapp);
+  set('step_sync', patch.stepSync);
+  set('step_drive', patch.stepDrive);
+  set('step_curriculum', patch.stepCurriculum);
+  set('step_cosmic_student', patch.stepCosmicStudent);
+  set('step_cosmic_project', patch.stepCosmicProject);
+  set('step_cosmic_sync_group', patch.stepCosmicSyncGroup);
+  set('drive_folder_id', patch.driveFolderId);
+  set('drive_folder_url', patch.driveFolderUrl);
+  set('cosmic_student_id', patch.cosmicStudentId);
+  set('cosmic_user_id', patch.cosmicUserId);
+  set('cosmic_project_id', patch.cosmicProjectId);
+  set('attempts', patch.attempts);
+  set('last_error', patch.lastError);
+  set('last_run_at', patch.lastRunAt);
+  set('completed_at', patch.completedAt);
+
+  const rows = await call<ProjectSetupRow[]>(
+    'PATCH',
+    `/project_setups?case_id=eq.${encodeURIComponent(caseId)}`,
+    { body, prefer: 'return=representation' }
+  );
+  const row = rows[0];
+  if (!row) throw new DbError(`project_setups ${caseId} not found`, 404, rows);
+  return toSetup(row);
+}
+
+/**
+ * Claim a case for this run: flip PENDING/FAILED -> RUNNING and bump attempts,
+ * but only if it is still PENDING or FAILED. The status filter in the PATCH
+ * makes this a compare-and-set, so if two ticks (or two replicas) race, only
+ * one gets a row back and the other sees none -- that one skips the case.
+ * Returns the claimed row, or null if someone else already claimed it.
+ */
+export async function claimForRun(
+  caseId: string,
+  attempts: number
+): Promise<ProjectSetup | null> {
+  const rows = await call<ProjectSetupRow[]>(
+    'PATCH',
+    `/project_setups?case_id=eq.${encodeURIComponent(caseId)}&status=in.(PENDING,FAILED)`,
+    {
+      body: {
+        status: 'RUNNING',
+        attempts: attempts + 1,
+        last_run_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      prefer: 'return=representation',
+    }
+  );
+  return rows[0] ? toSetup(rows[0]) : null;
+}
+
+/** Cheapest query that proves the API, the key and the tables all work. */
+export async function ping(): Promise<void> {
+  await call('GET', '/project_setups?select=case_id&limit=1');
+}

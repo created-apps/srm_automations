@@ -1,0 +1,25 @@
+# Railway deployment for the Stage 5 project-setup service.
+#
+# One process runs the reconciliation cron (which scans group_cases for
+# mentor-assigned cases whose project details have been filled in the
+# dashboard, and runs the setup steps for each: Drive, WhatsApp, SYNC,
+# curriculum, COSMIC student, COSMIC project, COSMIC<->SYNC link) and serves a
+# tiny health endpoint. It must stay awake -- don't put it behind serverless/sleep.
+
+[build]
+builder = "NIXPACKS"
+buildCommand = "npm run build"
+
+[deploy]
+startCommand = "npm run start"
+# No migration step: the tracking table lives in the same Supabase project as
+# the other two services. Run sql/001_project_setup.sql and sql/002_cosmic.sql
+# once in the Supabase SQL editor.
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+# Must stay at 1. The cron ticks inside every replica; a second one would race
+# to run the same case's setup twice. The per-case claim guards against a
+# double send, but there is no reason to run more than one replica.
+numReplicas = 1
