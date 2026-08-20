@@ -137,7 +137,7 @@ function splitName(full: string): { first: string; last: string } {
 
 function credentialsMessage(studentName: string, c: cosmic.Credentials): string {
   return (
-    `Hi ${studentName}! Your COSMIC LMS account is ready.\n` +
+    `Hi ${studentName}! For your project, we will be using the Learning Management System\n` +
     `Login at ${config.cosmic.loginUrl}\n` +
     `Username: ${c.username}\n` +
     `Password: ${c.password}\n` +
@@ -173,10 +173,20 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
   try {
     created = await cosmic.createStudent(payload);
   } catch (err) {
-    // Duplicate email (400) -> recover the existing student so the project can
-    // still be created. The one-time password isn't retrievable, so it isn't
-    // re-sent.
-    if (err instanceof cosmic.CosmicError && err.status === 400) {
+    // A duplicate-email conflict has two shapes:
+    //  1. The email is an existing STUDENT -> recover their id so the project
+    //     can still be created; the one-time password isn't retrievable, so it
+    //     is not re-sent.
+    //  2. The email belongs to a NON-student user (mentor/staff/counsellor) ->
+    //     there is no student to attach a project to, so skip the COSMIC steps
+    //     (self-heal + Slack) rather than failing the whole pipeline.
+    const isDuplicate =
+      err instanceof cosmic.CosmicError &&
+      err.status === 400 &&
+      /already exists|duplicate key|users_email_key|23505/i.test(
+        `${JSON.stringify(err.details)} ${err.message}`
+      );
+    if (isDuplicate) {
       const existing = await cosmic.findStudentByEmail(email);
       if (existing) {
         await db.updateSetup(s.caseId, {
@@ -187,6 +197,17 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
         if (existing.user_id) await cosmic.verifyUser(existing.user_id);
         return { status: 'OK', note: 'student already existed in COSMIC (credentials not re-sent)' };
       }
+      // Email is taken by a non-student user: nothing to attach. Skip the two
+      // downstream COSMIC steps too, so the case still finishes DONE.
+      await db.updateSetup(s.caseId, {
+        stepCosmicProject: 'SKIPPED',
+        stepCosmicSyncGroup: 'SKIPPED',
+      });
+      await slack.postNote(
+        `:warning: COSMIC account skipped for ${c.studentName}: ${email} already belongs to a ` +
+          `non-student COSMIC user (mentor/staff/counsellor). No student or project was created.`
+      );
+      return { status: 'SKIPPED', note: `${email} belongs to a non-student COSMIC user` };
     }
     throw err;
   }
