@@ -481,6 +481,13 @@ export async function runCase(caseId: string): Promise<void> {
   // at the end so a mentor added between ticks is picked up.
   sync.resetMentorCache();
 
+  // Whether this run is re-applying an edit to a case that had already been
+  // set up, rather than setting one up for the first time. Captured before the
+  // loop: the WhatsApp step advances appliedRevision, so by the end of the run
+  // the two revisions match and the distinction is gone.
+  const isReapplication =
+    setup.appliedRevision > 0 && setup.appliedRevision < setup.detailsRevision;
+
   // Details edited since the last run: re-open the WhatsApp step so the
   // correction reaches the group instead of being stranded on a case that
   // already finished. The Drive link step goes with it, since it rewrites the
@@ -558,6 +565,21 @@ export async function runCase(caseId: string): Promise<void> {
     completedAt: new Date(),
     lastError: null,
   });
+
+  // A case that was already set up and has just had an edit re-applied is not
+  // a completion, and saying so a second time reads as a duplicate of the
+  // original -- the setup steps did not run again, only the group name and
+  // description were rewritten. Report what actually happened instead.
+  if (isReapplication) {
+    await slack.postNote(
+      `:pencil2: Project details updated for <${slack.caseLink(caseId)}> ` +
+        `(${groupCase.studentName}) -- the WhatsApp group name and description ` +
+        `have been rewritten. The rest of the setup was already done.`
+    );
+    console.log(`[${caseId}] details re-applied (revision ${done.appliedRevision})`);
+    return;
+  }
+
   const link = done.driveFolderUrl ? ` Drive: ${done.driveFolderUrl}` : '';
   await slack.postNote(
     `:white_check_mark: Project setup complete for <${slack.caseLink(caseId)}> ` +
