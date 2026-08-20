@@ -98,22 +98,95 @@ export interface ResolvedMentor {
 }
 
 /**
- * Resolve a mentor by exact (normalised) name among SYNC's mentors, returning
- * their email/phone. Used to look the mentor up in COSMIC (by email). Returns
+ * SYNC's mentors, fetched once per run.
+ *
+ * Three steps need the mentor (the group membership, their Drive access and
+ * the COSMIC match) and each used to pull the whole mentor list for itself.
+ * The cache is cleared at the start of every case so a mentor added between
+ * ticks is still seen.
+ */
+let mentorCache: ResolvedMentor[] | null = null;
+
+export function resetMentorCache(): void {
+  mentorCache = null;
+}
+
+interface MentorRow {
+  id: string;
+  name: string;
+  email: string | null;
+  phone_number: string | null;
+}
+
+async function allMentors(): Promise<ResolvedMentor[]> {
+  if (mentorCache) return mentorCache;
+  const rows = await call<MentorRow[]>(
+    'GET',
+    `/users?select=id,name,email,phone_number&role=eq.mentor`
+  );
+  mentorCache = rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    email: r.email,
+    phone: r.phone_number,
+  }));
+  return mentorCache;
+}
+
+/**
+ * The mentor for a case.
+ *
+ * By SYNC id when the case carries one -- mentors added from the dashboard get
+ * a SYNC account at creation, and the id is stamped on the case when they are
+ * introduced. Only the older, name-only cases fall back to matching on name,
+ * which refuses to guess: zero or several matches is a failure to surface, not
+ * a pick, because linking the wrong mentor is the worst outcome available.
+ */
+export async function resolveMentorForCase(
+  groupCase: GroupCase
+): Promise<ResolvedMentor | null> {
+  if (!config.sync.configured) return null;
+
+  const mentors = await allMentors();
+
+  if (groupCase.mentorSyncUserId) {
+    const byId = mentors.find((m) => m.id === groupCase.mentorSyncUserId);
+    if (byId) return byId;
+    // The stored id no longer resolves (removed on SYNC, or no longer a
+    // mentor): fall through to the name match rather than doing nothing.
+  }
+
+  return resolveMentor(groupCase.mentorName ?? '');
+}
+
+/**
+ * Resolve a mentor by exact (normalised) name among SYNC's mentors. Returns
  * null on zero or multiple matches -- never guesses.
  */
 export async function resolveMentor(name: string): Promise<ResolvedMentor | null> {
   if (!config.sync.configured) return null;
   const trimmed = (name ?? '').trim();
   if (!trimmed) return null;
-  const rows = await call<
-    { id: string; name: string; email: string | null; phone_number: string | null }[]
-  >('GET', `/users?select=id,name,email,phone_number&role=eq.mentor`);
   const target = norm(trimmed);
-  const matches = rows.filter((r) => norm(r.name) === target);
-  if (matches.length !== 1) return null;
-  const m = matches[0]!;
-  return { id: m.id, name: m.name, email: m.email, phone: m.phone_number };
+  const matches = (await allMentors()).filter((m) => norm(m.name) === target);
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+/**
+ * Why a mentor couldn't be resolved, in words worth putting in front of a
+ * person. Only called on the failure path, so the extra request is fine.
+ */
+export async function explainUnresolved(groupCase: GroupCase): Promise<string> {
+  const name = (groupCase.mentorName ?? '').trim();
+  if (!name) return 'the case has no mentor name';
+  const matches = (await allMentors()).filter((m) => norm(m.name) === norm(name));
+  if (matches.length === 0) {
+    return `no SYNC mentor named "${name}" (the name must match a SYNC mentor exactly)`;
+  }
+  if (matches.length > 1) {
+    return `"${name}" matches ${matches.length} SYNC mentors -- ambiguous, not linking`;
+  }
+  return `"${name}" could not be resolved on SYNC`;
 }
 
 export async function linkMentor(groupCase: GroupCase): Promise<SyncResult> {
@@ -156,30 +229,12 @@ export async function linkMentor(groupCase: GroupCase): Promise<SyncResult> {
     );
   }
 
-  // 3. Resolve the mentor by exact (normalised) name among SYNC's mentors.
-  //    Refuse to guess: zero matches or more than one is a failure to surface,
-  //    never a silent pick -- linking the wrong mentor is the worst outcome.
-  const mentors = await call<SyncUserRow[]>(
-    'GET',
-    `/users?select=id,name&role=eq.mentor`
-  );
-  const target = norm(mentorName);
-  const matches = mentors.filter((m) => norm(m.name) === target);
-  if (matches.length === 0) {
-    throw new SyncError(
-      `no SYNC mentor named "${mentorName}" (name must match a SYNC mentor exactly)`,
-      404,
-      null
-    );
+  // 3. Resolve the mentor -- by the id stamped on the case, else by exact name.
+  const mentor = await resolveMentorForCase(groupCase);
+  if (!mentor) {
+    throw new SyncError(await explainUnresolved(groupCase), 404, null);
   }
-  if (matches.length > 1) {
-    throw new SyncError(
-      `"${mentorName}" matches ${matches.length} SYNC mentors -- ambiguous, not linking`,
-      409,
-      { ids: matches.map((m) => m.id) }
-    );
-  }
-  const mentorUserId = matches[0]!.id;
+  const mentorUserId = mentor.id;
 
   // 4. Insert the membership if it isn't already there (idempotent).
   const existing = await call<MembershipRow[]>(

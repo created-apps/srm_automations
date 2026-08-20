@@ -59,7 +59,12 @@ async function call<T>(
 // ---------------------------------------------------------------------------
 // group_cases (read only) -- just the columns Stage 5 needs.
 
-export type CaseStage = 'NEW' | 'IN_PROGRESS' | 'MENTOR_ASSIGNED' | 'ABANDONED';
+export type CaseStage =
+  | 'AWAITING_JOIN'
+  | 'NEW'
+  | 'IN_PROGRESS'
+  | 'MENTOR_ASSIGNED'
+  | 'ABANDONED';
 
 export interface GroupCase {
   id: string;
@@ -74,6 +79,15 @@ export interface GroupCase {
   projectName: string | null;
   stage: CaseStage;
   mentorName: string | null;
+  /**
+   * When the mentor's introduction actually went out. This is the gate the
+   * mentor-dependent steps wait on -- `stage` is a coarser field that other
+   * flows write, and "the family has been introduced to their mentor" is the
+   * thing those steps genuinely require.
+   */
+  mentorIntroSentAt: Date | null;
+  /** The mentor's SYNC users.id, stamped at introduction. */
+  mentorSyncUserId: string | null;
 }
 
 interface GroupCaseRow {
@@ -89,10 +103,12 @@ interface GroupCaseRow {
   project_name: string | null;
   stage: CaseStage;
   mentor_name: string | null;
+  mentor_intro_sent_at: string | null;
+  mentor_sync_user_id: string | null;
 }
 
 const CASE_COLUMNS =
-  'id,chat_id,group_name,student_name,student_phone,student_email,parent_name,parent_phone,parent_email,project_name,stage,mentor_name';
+  'id,chat_id,group_name,student_name,student_phone,student_email,parent_name,parent_phone,parent_email,project_name,stage,mentor_name,mentor_intro_sent_at,mentor_sync_user_id';
 
 function toCase(row: GroupCaseRow): GroupCase {
   return {
@@ -108,6 +124,8 @@ function toCase(row: GroupCaseRow): GroupCase {
     projectName: row.project_name,
     stage: row.stage,
     mentorName: row.mentor_name,
+    mentorIntroSentAt: row.mentor_intro_sent_at ? new Date(row.mentor_intro_sent_at) : null,
+    mentorSyncUserId: row.mentor_sync_user_id,
   };
 }
 
@@ -136,8 +154,10 @@ export interface ProjectSetup {
   submittedBy: string | null;
   status: SetupStatus;
   stepWhatsapp: StepStatus;
+  stepWhatsappDriveLink: StepStatus;
   stepSync: StepStatus;
   stepDrive: StepStatus;
+  stepMentorAccess: StepStatus;
   stepCurriculum: StepStatus;
   stepCosmicStudent: StepStatus;
   stepCosmicProject: StepStatus;
@@ -151,6 +171,10 @@ export interface ProjectSetup {
   lastError: string | null;
   lastRunAt: Date | null;
   completedAt: Date | null;
+  /** Bumped by whichever writer last changed the title or description. */
+  detailsRevision: number;
+  /** The revision this service has already put on WhatsApp. */
+  appliedRevision: number;
 }
 
 interface ProjectSetupRow {
@@ -162,8 +186,10 @@ interface ProjectSetupRow {
   submitted_by: string | null;
   status: SetupStatus;
   step_whatsapp: StepStatus;
+  step_whatsapp_drive_link: StepStatus;
   step_sync: StepStatus;
   step_drive: StepStatus;
+  step_mentor_access: StepStatus;
   step_curriculum: StepStatus;
   step_cosmic_student: StepStatus;
   step_cosmic_project: StepStatus;
@@ -177,6 +203,8 @@ interface ProjectSetupRow {
   last_error: string | null;
   last_run_at: string | null;
   completed_at: string | null;
+  details_revision: number;
+  applied_revision: number;
 }
 
 const date = (v: string | null): Date | null => (v === null ? null : new Date(v));
@@ -191,8 +219,10 @@ function toSetup(row: ProjectSetupRow): ProjectSetup {
     submittedBy: row.submitted_by,
     status: row.status,
     stepWhatsapp: row.step_whatsapp,
+    stepWhatsappDriveLink: row.step_whatsapp_drive_link,
     stepSync: row.step_sync,
     stepDrive: row.step_drive,
+    stepMentorAccess: row.step_mentor_access,
     stepCurriculum: row.step_curriculum,
     stepCosmicStudent: row.step_cosmic_student,
     stepCosmicProject: row.step_cosmic_project,
@@ -206,6 +236,8 @@ function toSetup(row: ProjectSetupRow): ProjectSetup {
     lastError: row.last_error,
     lastRunAt: date(row.last_run_at),
     completedAt: date(row.completed_at),
+    detailsRevision: row.details_revision,
+    appliedRevision: row.applied_revision,
   };
 }
 
@@ -220,21 +252,22 @@ export async function findSetup(caseId: string): Promise<ProjectSetup | null> {
 }
 
 /**
- * Cases the cron should run: their project details were submitted in the
- * dashboard, they are not already done, and the parent case has a mentor
- * assigned. The join to group_cases keeps a submitted-but-mentorless case out
- * of the working set. maxAttempts (when non-zero) drops cases that have failed
- * too many times.
+ * Cases the cron should look at: details submitted, not already finished.
  *
- * PostgREST embeds the parent row with `group_cases!inner(...)`, and the
- * `stage=eq` filter on the embedded resource makes the inner join selective.
+ * Note what is NOT filtered here any more. The mentor gate used to live in
+ * this query (`group_cases.stage = 'MENTOR_ASSIGNED'`), which kept the whole
+ * case out of the working set until a mentor existed. The WhatsApp title and
+ * description no longer wait for one, so the gate moved onto the individual
+ * steps that genuinely need a mentor -- see `mentorReady` in setup.ts. A case
+ * with no mentor yet is picked up, has its group renamed, and stops there.
+ *
+ * maxAttempts (when non-zero) drops cases that have failed too many times.
  */
 export async function listRunnable(maxAttempts: number): Promise<ProjectSetup[]> {
   const params = new URLSearchParams();
-  params.set('select', '*,group_cases!inner(stage)');
+  params.set('select', '*');
   params.set('submitted_at', 'not.is.null');
   params.set('status', 'in.(PENDING,FAILED)');
-  params.set('group_cases.stage', 'eq.MENTOR_ASSIGNED');
   if (maxAttempts > 0) params.set('attempts', `lt.${maxAttempts}`);
   params.set('order', 'submitted_at.asc');
 
@@ -245,8 +278,10 @@ export async function listRunnable(maxAttempts: number): Promise<ProjectSetup[]>
 export interface SetupPatch {
   status?: SetupStatus;
   stepWhatsapp?: StepStatus;
+  stepWhatsappDriveLink?: StepStatus;
   stepSync?: StepStatus;
   stepDrive?: StepStatus;
+  stepMentorAccess?: StepStatus;
   stepCurriculum?: StepStatus;
   stepCosmicStudent?: StepStatus;
   stepCosmicProject?: StepStatus;
@@ -260,6 +295,7 @@ export interface SetupPatch {
   lastError?: string | null;
   lastRunAt?: Date | null;
   completedAt?: Date | null;
+  appliedRevision?: number;
 }
 
 export async function updateSetup(
@@ -275,8 +311,10 @@ export async function updateSetup(
 
   set('status', patch.status);
   set('step_whatsapp', patch.stepWhatsapp);
+  set('step_whatsapp_drive_link', patch.stepWhatsappDriveLink);
   set('step_sync', patch.stepSync);
   set('step_drive', patch.stepDrive);
+  set('step_mentor_access', patch.stepMentorAccess);
   set('step_curriculum', patch.stepCurriculum);
   set('step_cosmic_student', patch.stepCosmicStudent);
   set('step_cosmic_project', patch.stepCosmicProject);
@@ -290,6 +328,7 @@ export async function updateSetup(
   set('last_error', patch.lastError);
   set('last_run_at', patch.lastRunAt);
   set('completed_at', patch.completedAt);
+  set('applied_revision', patch.appliedRevision);
 
   const rows = await call<ProjectSetupRow[]>(
     'PATCH',

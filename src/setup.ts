@@ -8,45 +8,96 @@ import * as slack from './slack';
 import { config } from './config';
 
 /**
- * Run the five Stage 5 steps for one case, in order, resuming from wherever a
+ * Run the Stage 5 steps for one case, in order, resuming from wherever a
  * previous attempt got to. A step that throws stops the run: its status is
  * recorded FAILED, the case is left FAILED, and the cron retries it next tick
  * (up to SETUP_MAX_ATTEMPTS). A step that returns "skip" is a deliberate no-op.
  *
- * Steps 1 and 5 on the diagram are the same WhatsApp update, so there are four
- * real steps: whatsapp, sync, drive, curriculum.
+ * ## Two gates, not one
+ *
+ * The steps no longer all wait for the same thing. Naming the WhatsApp group
+ * and giving it a description only needs the project details, which arrive
+ * from the dashboard or the intake sheet as soon as the brainstorm is done --
+ * often well before a mentor exists. Everything else (the Drive folder, the
+ * SYNC membership, the mentor's access, COSMIC) genuinely needs the mentor, so
+ * those steps wait for the introduction to have gone out.
+ *
+ * A step whose gate isn't open is BLOCKED: it stays PENDING, the run stops
+ * there without being a failure, and the case is picked up again next tick.
+ * Blocking never burns a retry -- waiting for a mentor is not a failed attempt.
+ *
+ * The Drive link belongs in the group description but the folder doesn't exist
+ * until the mentor gate opens, so the WhatsApp work is two steps: the details
+ * now, the link appended after.
  */
 
 const PLACEHOLDER_SUFFIX = ': Custom Project';
 
-type StepOutcome = { status: Extract<StepStatus, 'OK' | 'SKIPPED'>; note?: string };
+type StepOutcome =
+  | { status: Extract<StepStatus, 'OK' | 'SKIPPED'>; note?: string }
+  /** Not now, not a failure: leave the step PENDING and stop the run. */
+  | { status: 'BLOCKED'; note: string };
 
-/** The WhatsApp group name after applying the project title, per the rule:
- *  only rewrite when the name is still the "...: Custom Project" placeholder. */
-function nextGroupName(groupName: string, projectTitle: string): string | null {
+/**
+ * The WhatsApp group name after applying the project title.
+ *
+ * Normally only the "...: Custom Project" placeholder is rewritten -- a group
+ * that already carries a real project name is left alone, because renaming a
+ * family's chat unprompted is worse than a title being slightly stale.
+ *
+ * `force` is the exception: the details were edited after this case had
+ * already been set up, which is someone explicitly correcting the name. Then
+ * the part after the first ": " is replaced, keeping whatever prefix the group
+ * was created with.
+ */
+function nextGroupName(
+  groupName: string,
+  projectTitle: string,
+  force: boolean
+): string | null {
   if (groupName.toLowerCase().endsWith(PLACEHOLDER_SUFFIX.toLowerCase())) {
     return groupName.slice(0, groupName.length - PLACEHOLDER_SUFFIX.length) + `: ${projectTitle}`;
   }
+
+  if (force) {
+    const separator = groupName.indexOf(': ');
+    const renamed =
+      separator === -1
+        ? `${groupName}: ${projectTitle}`
+        : `${groupName.slice(0, separator)}: ${projectTitle}`;
+    return renamed === groupName ? null : renamed;
+  }
+
   return null; // a real project name is already there -- leave the title alone
 }
 
+/** Has the mentor actually been introduced to the family? */
+function mentorReady(c: GroupCase): boolean {
+  return c.mentorIntroSentAt !== null;
+}
+
+const WAITING_FOR_MENTOR = 'waiting for the mentor introduction';
+
 // --- individual steps ------------------------------------------------------
 
+/**
+ * Step 1 -- the group's name and description, as soon as the details exist.
+ *
+ * Runs before any mentor is assigned, so the description carries the project
+ * text only; the Drive link is appended later by stepWhatsappDriveLink.
+ */
 async function stepWhatsapp(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
   const title = (s.projectTitle ?? '').trim();
   const description = (s.projectDescription ?? '').trim();
 
-  // The group description carries the project description and the student's
-  // Drive link. Drive runs before this step, so driveFolderUrl is set by now.
-  const descriptionParts: string[] = [];
-  if (description) descriptionParts.push(description);
-  if (s.driveFolderUrl) descriptionParts.push(`Project Drive: ${s.driveFolderUrl}`);
-  const fullDescription = descriptionParts.join('\n\n');
+  // An edit after this case was already set up: the rename rule is relaxed so
+  // the correction actually reaches the group.
+  const force = s.appliedRevision < s.detailsRevision && s.appliedRevision > 0;
 
-  const newName = title ? nextGroupName(c.groupName, title) : null;
+  const newName = title ? nextGroupName(c.groupName, title, force) : null;
   const settings: { name?: string; description?: string } = {};
   if (newName) settings.name = newName;
-  if (fullDescription) settings.description = fullDescription;
+  if (description) settings.description = description;
 
   if (Object.keys(settings).length === 0) {
     return { status: 'SKIPPED', note: 'nothing to change (no new title/description)' };
@@ -55,12 +106,36 @@ async function stepWhatsapp(c: GroupCase, s: ProjectSetup): Promise<StepOutcome>
   return { status: 'OK' };
 }
 
+/**
+ * Step 5 -- put the student's Drive folder in the group description.
+ *
+ * Separate from step 1 only because the folder doesn't exist until the mentor
+ * gate opens. Rewrites the whole description rather than appending to whatever
+ * is there, so a re-run can't stack up duplicate links.
+ */
+async function stepWhatsappDriveLink(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
+  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
+  if (!s.driveFolderUrl) {
+    return { status: 'SKIPPED', note: 'no Drive folder to link' };
+  }
+
+  const description = (s.projectDescription ?? '').trim();
+  const parts = description ? [description] : [];
+  parts.push(`Project Drive: ${s.driveFolderUrl}`);
+
+  await periskope.updateGroupSettings(c.chatId, { description: parts.join('\n\n') });
+  return { status: 'OK' };
+}
+
 async function stepSync(c: GroupCase): Promise<StepOutcome> {
+  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
   const result = await sync.linkMentor(c);
   return result.skipped ? { status: 'SKIPPED', note: result.reason } : { status: 'OK' };
 }
 
 async function stepDrive(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
+  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
+
   // Reuse the folder from a prior attempt so a retry never makes a second one.
   let folderId = s.driveFolderId;
   if (!folderId) {
@@ -105,10 +180,75 @@ async function stepDrive(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
   return { status: 'OK', note: notes.join('; ') || undefined };
 }
 
-async function stepCurriculum(s: ProjectSetup): Promise<StepOutcome> {
+/**
+ * Step 4 -- give the mentor editor access to the student's Drive folder.
+ *
+ * Its own step rather than a third grantee inside stepDrive, because it is the
+ * only part of that work that needs the mentor resolved. Folded in there, a
+ * mentor whose name doesn't match SYNC would either fail the Drive step (and
+ * with it the WhatsApp, curriculum and COSMIC steps that don't care about
+ * mentors at all) or be marked done and never retried once the name was fixed.
+ *
+ * It runs after stepSync deliberately: the same resolution failure surfaces
+ * there first, with a message that says exactly what is wrong with the name.
+ */
+async function stepMentorAccess(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
+  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
+  if (!sync.syncConfigured()) {
+    return { status: 'SKIPPED', note: 'SYNC not configured -- no mentor email to grant' };
+  }
+  if (!s.driveFolderId) {
+    throw new Error('mentor access: no Drive folder (step 2 must run first)');
+  }
+
+  const mentor = await sync.resolveMentorForCase(c);
+  if (!mentor) {
+    throw new Error(`mentor access: ${await sync.explainUnresolved(c)}`);
+  }
+
+  const email = (mentor.email ?? '').trim();
+  if (!email) {
+    // Nothing to grant to, and nothing a retry would fix. Skipped with a note
+    // rather than failed, so the rest of the setup still completes.
+    return {
+      status: 'SKIPPED',
+      note: `SYNC has no email for ${mentor.name} -- Drive access not granted`,
+    };
+  }
+
+  try {
+    await drive.grantAccess(s.driveFolderId, email, 'writer');
+  } catch (err) {
+    // Same allowance the family's addresses get: a non-Google address can't be
+    // shared with, and no number of retries changes that.
+    if (
+      err instanceof drive.DriveError &&
+      err.status === 403 &&
+      JSON.stringify(err.details).includes('cannotInviteNonGoogleUser')
+    ) {
+      return {
+        status: 'SKIPPED',
+        note: `${email} has no Google account -- Drive access not granted`,
+      };
+    }
+    throw err;
+  }
+  return { status: 'OK', note: `granted ${email} editor access` };
+}
+
+async function stepCurriculum(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
+  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
+
   const subject = (s.curriculumSubject ?? '').trim();
-  if (!subject || subject.toUpperCase() === 'NONE') {
-    return { status: 'SKIPPED', note: 'no curriculum chosen' };
+  if (subject.toUpperCase() === 'NONE') {
+    return { status: 'SKIPPED', note: 'curriculum explicitly set to NONE' };
+  }
+  // The subject is only ever chosen in the dashboard, so a case submitted from
+  // the intake sheet arrives without one. That is a hold, not a skip: the case
+  // stops just short of DONE and stays visible as unfinished until somebody
+  // picks a subject, rather than quietly completing with no curriculum copied.
+  if (!subject) {
+    return { status: 'BLOCKED', note: 'no curriculum subject chosen yet (dashboard)' };
   }
   if (!s.driveFolderId) {
     throw new Error('curriculum: no Drive folder to copy into (step 3 must run first)');
@@ -147,6 +287,7 @@ function credentialsMessage(studentName: string, c: cosmic.Credentials): string 
 
 /** Step 5 -- create the student in COSMIC and send their login to the group. */
 async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
+  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
   if (!cosmic.cosmicConfigured()) return { status: 'SKIPPED', note: 'COSMIC not configured' };
   if (s.cosmicStudentId) return { status: 'OK' }; // created on a prior attempt
 
@@ -239,6 +380,7 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
 
 /** Step 6 -- create the project in COSMIC, linked to the student and mentor. */
 async function stepCosmicProject(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
+  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
   if (!cosmic.cosmicConfigured()) return { status: 'SKIPPED', note: 'COSMIC not configured' };
   if (s.cosmicProjectId) return { status: 'OK' };
   if (!s.cosmicStudentId) throw new Error('cosmic project: no student id (student step must run first)');
@@ -250,7 +392,7 @@ async function stepCosmicProject(c: GroupCase, s: ProjectSetup): Promise<StepOut
   let mentorId: string | undefined;
   const mentorName = (c.mentorName ?? '').trim();
   if (mentorName) {
-    const resolved = await sync.resolveMentor(mentorName).catch(() => null);
+    const resolved = await sync.resolveMentorForCase(c).catch(() => null);
     mentorId = (await cosmic.findMentorId({ email: resolved?.email ?? null, name: mentorName })) ?? undefined;
   }
 
@@ -278,6 +420,7 @@ async function stepCosmicProject(c: GroupCase, s: ProjectSetup): Promise<StepOut
 
 /** Step 7 -- link the COSMIC project to its SYNC group (sets sync_group_id). */
 async function stepCosmicSyncGroup(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
+  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
   if (!cosmic.cosmicConfigured()) return { status: 'SKIPPED', note: 'COSMIC not configured' };
   if (!sync.syncConfigured()) return { status: 'SKIPPED', note: 'SYNC not configured -- no group id to link' };
   if (!s.cosmicProjectId) throw new Error('cosmic sync-group: no project id (project step must run first)');
@@ -292,41 +435,37 @@ async function stepCosmicSyncGroup(c: GroupCase, s: ProjectSetup): Promise<StepO
 // --- orchestration ---------------------------------------------------------
 
 interface StepDef {
-  key:
-    | 'whatsapp'
-    | 'sync'
-    | 'drive'
-    | 'curriculum'
-    | 'cosmic_student'
-    | 'cosmic_project'
-    | 'cosmic_sync_group';
-  column:
-    | 'stepWhatsapp'
-    | 'stepSync'
-    | 'stepDrive'
-    | 'stepCurriculum'
-    | 'stepCosmicStudent'
-    | 'stepCosmicProject'
-    | 'stepCosmicSyncGroup';
+  key: string;
+  column: keyof db.SetupPatch;
   current: (s: ProjectSetup) => StepStatus;
   run: (c: GroupCase, s: ProjectSetup) => Promise<StepOutcome>;
 }
 
-// Drive runs before WhatsApp so the group description can include the Drive
-// link. Curriculum copies into the Drive folder, so it stays after Drive too.
+/**
+ * Order matters in three places:
+ *  - whatsapp is first and ungated, so the group is named as soon as the
+ *    details land;
+ *  - drive precedes mentor_access and whatsapp_drive_link, which both need the
+ *    folder, and sync precedes mentor_access so a bad mentor name is reported
+ *    by the step whose message explains it;
+ *  - curriculum is last, because it is the one step that can hold on something
+ *    only a human supplies, and holding it must not delay COSMIC.
+ */
 const STEPS: StepDef[] = [
-  { key: 'drive', column: 'stepDrive', current: (s) => s.stepDrive, run: (c, s) => stepDrive(c, s) },
   { key: 'whatsapp', column: 'stepWhatsapp', current: (s) => s.stepWhatsapp, run: (c, s) => stepWhatsapp(c, s) },
+  { key: 'drive', column: 'stepDrive', current: (s) => s.stepDrive, run: (c, s) => stepDrive(c, s) },
   { key: 'sync', column: 'stepSync', current: (s) => s.stepSync, run: (c) => stepSync(c) },
-  { key: 'curriculum', column: 'stepCurriculum', current: (s) => s.stepCurriculum, run: (_c, s) => stepCurriculum(s) },
+  { key: 'mentor_access', column: 'stepMentorAccess', current: (s) => s.stepMentorAccess, run: (c, s) => stepMentorAccess(c, s) },
+  { key: 'whatsapp_drive_link', column: 'stepWhatsappDriveLink', current: (s) => s.stepWhatsappDriveLink, run: (c, s) => stepWhatsappDriveLink(c, s) },
   { key: 'cosmic_student', column: 'stepCosmicStudent', current: (s) => s.stepCosmicStudent, run: (c, s) => stepCosmicStudent(c, s) },
   { key: 'cosmic_project', column: 'stepCosmicProject', current: (s) => s.stepCosmicProject, run: (c, s) => stepCosmicProject(c, s) },
   { key: 'cosmic_sync_group', column: 'stepCosmicSyncGroup', current: (s) => s.stepCosmicSyncGroup, run: (c, s) => stepCosmicSyncGroup(c, s) },
+  { key: 'curriculum', column: 'stepCurriculum', current: (s) => s.stepCurriculum, run: (c, s) => stepCurriculum(c, s) },
 ];
 
 /**
  * Run (or resume) one case that has already been claimed (status RUNNING).
- * `setup` is the freshly-claimed row. Returns nothing; all state is persisted.
+ * Returns nothing; all state is persisted.
  */
 export async function runCase(caseId: string): Promise<void> {
   const groupCase = await db.findCaseById(caseId);
@@ -337,15 +476,50 @@ export async function runCase(caseId: string): Promise<void> {
   let setup = await db.findSetup(caseId);
   if (!setup) throw new Error(`project_setups ${caseId} vanished`);
 
+  // SYNC's mentor list is cached for the duration of one case, so the three
+  // steps that need the mentor share a single fetch. Cleared here rather than
+  // at the end so a mentor added between ticks is picked up.
+  sync.resetMentorCache();
+
+  // Details edited since the last run: re-open the WhatsApp step so the
+  // correction reaches the group instead of being stranded on a case that
+  // already finished. The Drive link step goes with it, since it rewrites the
+  // same description.
+  if (setup.appliedRevision < setup.detailsRevision && setup.stepWhatsapp !== 'PENDING') {
+    setup = await db.updateSetup(caseId, {
+      stepWhatsapp: 'PENDING',
+      ...(setup.stepWhatsappDriveLink === 'OK' ? { stepWhatsappDriveLink: 'PENDING' as const } : {}),
+    });
+    console.log(
+      `[${caseId}] project details changed (revision ${setup.appliedRevision} -> ` +
+        `${setup.detailsRevision}), re-applying to WhatsApp`
+    );
+  }
+
+  const blocked: string[] = [];
+  let progressed = false;
+
   for (const step of STEPS) {
     if (step.current(setup) === 'OK' || step.current(setup) === 'SKIPPED') continue;
 
     try {
       const outcome = await step.run(groupCase, setup);
+
+      if (outcome.status === 'BLOCKED') {
+        // Not now, and not a failure. The step stays PENDING and the run stops
+        // here -- everything after it either needs this step's output or is
+        // waiting on the same thing.
+        blocked.push(`${step.key}: ${outcome.note}`);
+        break;
+      }
+
       setup = await db.updateSetup(caseId, {
         [step.column]: outcome.status,
         lastError: null,
+        // The group now reflects this revision of the details.
+        ...(step.key === 'whatsapp' ? { appliedRevision: setup.detailsRevision } : {}),
       } as db.SetupPatch);
+      progressed = true;
       if (outcome.note) console.log(`[${caseId}] ${step.key}: ${outcome.status} (${outcome.note})`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -361,6 +535,22 @@ export async function runCase(caseId: string): Promise<void> {
       console.error(`[${caseId}] ${step.key} FAILED:`, message);
       return; // stop -- retried next tick
     }
+  }
+
+  if (blocked.length > 0) {
+    // Back to PENDING for the next tick, and attempts reset: a case waiting on
+    // a mentor or a curriculum choice must not exhaust its retry budget and
+    // drop out of the working set for something that was never a failure.
+    await db.updateSetup(caseId, {
+      status: 'PENDING',
+      attempts: 0,
+      lastError: null,
+    });
+    // Only worth saying when something actually moved. A case waiting on a
+    // mentor is re-examined every tick, and logging that each time would bury
+    // everything else in the deploy logs.
+    if (progressed) console.log(`[${caseId}] holding -- ${blocked.join('; ')}`);
+    return;
   }
 
   const done = await db.updateSetup(caseId, {
