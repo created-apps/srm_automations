@@ -81,6 +81,23 @@ const WAITING_FOR_MENTOR = 'waiting for the mentor introduction';
 // --- individual steps ------------------------------------------------------
 
 /**
+ * The group description: the project description, then the Drive link.
+ *
+ * One composer for both WhatsApp steps, so whichever runs last writes the same
+ * text rather than one of them dropping what the other put there. The folder
+ * usually exists before either runs -- intake makes it with the group -- but
+ * on a case whose folder was made later, at the mentor gate, the link is
+ * simply absent from the first write and present in the second.
+ */
+function groupDescription(s: ProjectSetup): string {
+  const parts: string[] = [];
+  const description = (s.projectDescription ?? '').trim();
+  if (description) parts.push(description);
+  if (s.driveFolderUrl) parts.push(`Project Drive: ${s.driveFolderUrl}`);
+  return parts.join('\n\n');
+}
+
+/**
  * Step 1 -- the group's name and description, as soon as the details exist.
  *
  * Runs before any mentor is assigned, so the description carries the project
@@ -88,7 +105,7 @@ const WAITING_FOR_MENTOR = 'waiting for the mentor introduction';
  */
 async function stepWhatsapp(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
   const title = (s.projectTitle ?? '').trim();
-  const description = (s.projectDescription ?? '').trim();
+  const description = groupDescription(s);
 
   // An edit after this case was already set up: the rename rule is relaxed so
   // the correction actually reaches the group.
@@ -119,11 +136,7 @@ async function stepWhatsappDriveLink(c: GroupCase, s: ProjectSetup): Promise<Ste
     return { status: 'SKIPPED', note: 'no Drive folder to link' };
   }
 
-  const description = (s.projectDescription ?? '').trim();
-  const parts = description ? [description] : [];
-  parts.push(`Project Drive: ${s.driveFolderUrl}`);
-
-  await periskope.updateGroupSettings(c.chatId, { description: parts.join('\n\n') });
+  await periskope.updateGroupSettings(c.chatId, { description: groupDescription(s) });
   return { status: 'OK' };
 }
 
@@ -155,6 +168,11 @@ async function stepDrive(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
   const grantees: Array<[label: string, email: string | null]> = [
     ['student', c.studentEmail],
     ['parent', c.parentEmail],
+    // The standing ops list. Re-granting someone the same role is accepted by
+    // Drive, so this is harmless on a folder intake already shared.
+    ...config.google.autoAccessEmails.map(
+      (email) => ['team', email] as [string, string | null]
+    ),
   ];
   for (const [label, email] of grantees) {
     if (!email || !email.trim()) {

@@ -99,6 +99,16 @@ export const config = {
     sharedDriveId: required('GOOGLE_SHARED_DRIVE_ID'),
     // Optional folder within the Shared Drive to nest student folders under.
     studentsParentFolderId: optional('GOOGLE_STUDENTS_PARENT_FOLDER_ID'),
+    /**
+     * People who get editor access to every student folder -- the ops team.
+     * Same DRIVE_AUTO_ACCESS_EMAILS the intake service reads, so a folder made
+     * by either of them ends up shared with the same people. Mentors are not
+     * on this list: they are granted access individually, once introduced.
+     */
+    autoAccessEmails: optional('DRIVE_AUTO_ACCESS_EMAILS')
+      .split(',')
+      .map((e) => e.trim())
+      .filter(Boolean),
     templates: curriculumTemplates(),
   },
 
