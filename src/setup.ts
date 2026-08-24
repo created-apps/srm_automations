@@ -406,12 +406,23 @@ async function stepCosmicProject(c: GroupCase, s: ProjectSetup): Promise<StepOut
   const title = (s.projectTitle ?? '').trim() || c.groupName;
 
   // Resolve the COSMIC mentor id: mentor email via SYNC, then match in COSMIC
-  // (falling back to a name match). A missing mentor doesn't block the project.
+  // (falling back to a name match).
   let mentorId: string | undefined;
   const mentorName = (c.mentorName ?? '').trim();
   if (mentorName) {
     const resolved = await sync.resolveMentorForCase(c).catch(() => null);
     mentorId = (await cosmic.findMentorId({ email: resolved?.email ?? null, name: mentorName })) ?? undefined;
+  }
+
+  // COSMIC cannot create a project without a mentor -- a missing mentor_id is
+  // stringified to "None" and rejected as an invalid uuid. Fail with an
+  // actionable message rather than sending that request; once the mentor exists
+  // in COSMIC (matching name or email) this step succeeds on the next retry.
+  if (!mentorId) {
+    throw new Error(
+      `cosmic project: no COSMIC mentor matches "${mentorName || '(no mentor on case)'}" ` +
+        `-- create the mentor in COSMIC with a matching name or email, then this retries.`
+    );
   }
 
   const start = new Date();
@@ -420,7 +431,7 @@ async function stepCosmicProject(c: GroupCase, s: ProjectSetup): Promise<StepOut
   const ymd = (d: Date) => d.toISOString().slice(0, 10);
 
   const created = await cosmic.createProject({
-    ...(mentorId ? { mentor_id: mentorId } : {}),
+    mentor_id: mentorId,
     student_id: s.cosmicStudentId,
     project_name: title,
     ...(s.projectDescription ? { project_description: s.projectDescription } : {}),
@@ -430,10 +441,7 @@ async function stepCosmicProject(c: GroupCase, s: ProjectSetup): Promise<StepOut
     end_date: ymd(end),
   });
   await db.updateSetup(s.caseId, { cosmicProjectId: created.id });
-  return {
-    status: 'OK',
-    note: mentorId ? undefined : `no COSMIC mentor matched "${mentorName}" -- project created without a mentor`,
-  };
+  return { status: 'OK' };
 }
 
 /** Step 7 -- link the COSMIC project to its SYNC group (sets sync_group_id). */
