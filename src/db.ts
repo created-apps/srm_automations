@@ -88,6 +88,12 @@ export interface GroupCase {
   mentorIntroSentAt: Date | null;
   /** The mentor's SYNC users.id, stamped at introduction. */
   mentorSyncUserId: string | null;
+  /**
+   * The dashboard's kill switch. Set means someone stopped this case: nothing
+   * here may touch its WhatsApp group, Drive folder, SYNC or Cosmic records
+   * ever again.
+   */
+  operationsStoppedAt: Date | null;
 }
 
 interface GroupCaseRow {
@@ -105,10 +111,11 @@ interface GroupCaseRow {
   mentor_name: string | null;
   mentor_intro_sent_at: string | null;
   mentor_sync_user_id: string | null;
+  operations_stopped_at: string | null;
 }
 
 const CASE_COLUMNS =
-  'id,chat_id,group_name,student_name,student_phone,student_email,parent_name,parent_phone,parent_email,project_name,stage,mentor_name,mentor_intro_sent_at,mentor_sync_user_id';
+  'id,chat_id,group_name,student_name,student_phone,student_email,parent_name,parent_phone,parent_email,project_name,stage,mentor_name,mentor_intro_sent_at,mentor_sync_user_id,operations_stopped_at';
 
 function toCase(row: GroupCaseRow): GroupCase {
   return {
@@ -126,6 +133,9 @@ function toCase(row: GroupCaseRow): GroupCase {
     mentorName: row.mentor_name,
     mentorIntroSentAt: row.mentor_intro_sent_at ? new Date(row.mentor_intro_sent_at) : null,
     mentorSyncUserId: row.mentor_sync_user_id,
+    operationsStoppedAt: row.operations_stopped_at
+      ? new Date(row.operations_stopped_at)
+      : null,
   };
 }
 
@@ -265,9 +275,13 @@ export async function findSetup(caseId: string): Promise<ProjectSetup | null> {
  */
 export async function listRunnable(maxAttempts: number): Promise<ProjectSetup[]> {
   const params = new URLSearchParams();
-  params.set('select', '*');
+  // The embed is `!inner` purely to filter on the case: a stopped case's setup
+  // must never be claimed, and an inner join is how PostgREST expresses that
+  // in one request. Nothing reads the embedded columns -- toSetup ignores them.
+  params.set('select', '*,group_cases!inner(operations_stopped_at)');
   params.set('submitted_at', 'not.is.null');
   params.set('status', 'in.(PENDING,FAILED)');
+  params.set('group_cases.operations_stopped_at', 'is.null');
   if (maxAttempts > 0) params.set('attempts', `lt.${maxAttempts}`);
   params.set('order', 'submitted_at.asc');
 

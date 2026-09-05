@@ -497,6 +497,16 @@ export async function runCase(caseId: string): Promise<void> {
   const groupCase = await db.findCaseById(caseId);
   if (!groupCase) throw new Error(`case ${caseId} vanished`);
 
+  // Stopped between listRunnable and the claim above. Hand the row back as
+  // PENDING rather than leaving it RUNNING or marking it FAILED: nothing went
+  // wrong, and nothing ran. listRunnable will not offer it again while the
+  // case is stopped, so PENDING is where it correctly comes to rest.
+  if (groupCase.operationsStoppedAt) {
+    await db.updateSetup(caseId, { status: 'PENDING' });
+    console.log(`[${caseId}] operations stopped -- setup not run`);
+    return;
+  }
+
   // Re-read the setup so we act on the latest step statuses (and the folder id
   // a prior attempt may have saved).
   let setup = await db.findSetup(caseId);
