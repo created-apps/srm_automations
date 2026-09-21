@@ -63,7 +63,8 @@ dashboard OR intake sheet fills  ──> submitted_at set
 
 - A case is **eligible** when `project_setups.submitted_at` is set. The
   dashboard sets it on submit; the sheet sync sets it once the row carries both
-  a Project Name and a Project Description.
+  a Project Name and a Project Description. Failing both, the cron **fires it
+  itself** — see below.
 - Each step's outcome is recorded (`OK` / `SKIPPED` / `FAILED`), so a retry
   **resumes from the first step that isn't done** rather than repeating work.
   The created Drive folder id is saved before access is granted, so a retry
@@ -84,6 +85,31 @@ the WhatsApp steps re-open so the correction actually reaches the group — and
 the rename rule is relaxed for that run, since an edit is somebody explicitly
 correcting the name. A case that had already reached DONE is put back to
 PENDING by the writer, so the change isn't stranded.
+
+## Auto-fire: a ready case does not wait for a button
+
+Each pass starts with a sweep (`db.autoSubmitReady`) over the rows nobody has
+submitted. A row whose **project title and description are both filled in**, on
+a case whose **mentor has already been introduced**
+(`group_cases.mentor_intro_sent_at`) and which is not stopped, has `submitted_at`
+stamped by the cron itself with `submitted_by = 'auto'`, and joins the working
+set on that same tick. Nothing else is special about it: every step then runs
+exactly as it does for a submitted case.
+
+This exists because the two ordinary writers do not always get the chance. The
+sheet sync adopts details it finds on its first pass as a *baseline* rather than
+a submission, and a case whose details predate the gate has no `submitted_at`
+either — so a case could sit fully specified, with a mentor introduced, waiting
+on a button press that adds no information.
+
+The one thing the sweep cannot supply is the **curriculum subject**, which is
+only ever chosen in the dashboard. So an auto-fired case runs everything else
+and then holds on curriculum (below). Because that hold means it never reaches
+DONE and so never posts the completion note, the run posts a note of its own the
+tick the last other step lands: *complete, except the curriculum*.
+
+The stamping PATCH is filtered on `submitted_at is null`, so a real submission
+landing in the same moment wins and the sweep writes nothing.
 
 ## Curriculum holds rather than skips
 

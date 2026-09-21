@@ -593,6 +593,21 @@ export async function runCase(caseId: string): Promise<void> {
     // mentor is re-examined every tick, and logging that each time would bury
     // everything else in the deploy logs.
     if (progressed) console.log(`[${caseId}] holding -- ${blocked.join('; ')}`);
+
+    // Curriculum is the last step, so if it is the only thing holding, every
+    // other part of the setup has just finished. That case never reaches DONE
+    // and so never posts the completion note, which on an auto-fired case (no
+    // dashboard submission, hence never a subject) would mean the work
+    // completes in silence. Say it once -- `progressed` is only true on the
+    // tick that finished the last step, so the following ticks stay quiet.
+    if (progressed && blocked.length === 1 && blocked[0]!.startsWith('curriculum:')) {
+      await slack.postNote(
+        `:white_check_mark: Project setup complete for <${slack.caseLink(caseId)}> ` +
+          `(${groupCase.studentName}), except the curriculum -- pick a subject in the ` +
+          `dashboard and it will be copied in.` +
+          (setup.driveFolderUrl ? ` Drive: ${setup.driveFolderUrl}` : '')
+      );
+    }
     return;
   }
 
@@ -629,6 +644,19 @@ export async function runCase(caseId: string): Promise<void> {
  * RUNNING), and run it. Claiming is what stops two ticks running the same case.
  */
 export async function reconcileOnce(): Promise<{ ran: number }> {
+  // Before looking at the working set, let in the cases that are plainly ready
+  // but that nobody submitted -- a complete title and description with the
+  // mentor already introduced. They join the same pass; see db.autoSubmitReady.
+  try {
+    const fired = await db.autoSubmitReady();
+    for (const caseId of fired) {
+      console.log(`[${caseId}] auto-fired: details complete and mentor introduced`);
+    }
+  } catch (err) {
+    // Never let this stop the cases that were submitted the ordinary way.
+    console.error('auto-fire sweep threw:', err instanceof Error ? err.message : err);
+  }
+
   const runnable = await db.listRunnable(config.setup.maxAttempts);
   let ran = 0;
   for (const s of runnable) {

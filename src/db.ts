@@ -289,6 +289,64 @@ export async function listRunnable(maxAttempts: number): Promise<ProjectSetup[]>
   return rows.map(toSetup);
 }
 
+/**
+ * The auto-fire gate: cases nobody has submitted, but which plainly are ready.
+ *
+ * A case becomes eligible for the cron when `submitted_at` is set, which the
+ * dashboard's Project Setup action and the sheet sync both do. Neither always
+ * gets the chance: the sheet sync adopts details it finds on its first pass as
+ * a baseline rather than a submission, and a case whose details were written
+ * before that gate existed has none either. Those cases would sit with a
+ * complete title, a complete description and an introduced mentor, waiting for
+ * a human to press a button that adds nothing.
+ *
+ * So when a row carries both halves of the details and the mentor has actually
+ * been introduced, this stamps `submitted_at` itself (`submitted_by = 'auto'`,
+ * to keep it distinguishable from a real submission) and the case joins the
+ * normal working set on the same tick. Every step then runs as it always has
+ * -- including the curriculum's hold, which is the one thing this cannot
+ * supply: the subject is only ever chosen in the dashboard, so an auto-fired
+ * case completes everything else and stops just short of DONE.
+ *
+ * The PATCH is filtered on `submitted_at=is.null`, so a real submission landing
+ * in between wins and this writes nothing.
+ *
+ * Returns the ids it fired, for the log.
+ */
+export async function autoSubmitReady(): Promise<string[]> {
+  const params = new URLSearchParams();
+  params.set('select', 'case_id,project_title,project_description,group_cases!inner(mentor_intro_sent_at,operations_stopped_at)');
+  params.set('submitted_at', 'is.null');
+  params.set('status', 'in.(PENDING,FAILED)');
+  params.set('project_title', 'not.is.null');
+  params.set('project_description', 'not.is.null');
+  // The two case-side conditions: introduced, and not stopped.
+  params.set('group_cases.mentor_intro_sent_at', 'not.is.null');
+  params.set('group_cases.operations_stopped_at', 'is.null');
+
+  type Row = Pick<ProjectSetupRow, 'case_id' | 'project_title' | 'project_description'>;
+  const rows = await call<Row[]>('GET', `/project_setups?${params}`);
+
+  const fired: string[] = [];
+  for (const row of rows) {
+    // `not.is.null` does not exclude the empty string a cleared cell leaves
+    // behind, and neither half is really there if it is blank.
+    if (!row.project_title?.trim() || !row.project_description?.trim()) continue;
+
+    const now = new Date().toISOString();
+    const patched = await call<ProjectSetupRow[]>(
+      'PATCH',
+      `/project_setups?case_id=eq.${encodeURIComponent(row.case_id)}&submitted_at=is.null`,
+      {
+        body: { submitted_at: now, submitted_by: 'auto', updated_at: now },
+        prefer: 'return=representation',
+      }
+    );
+    if (patched[0]) fired.push(row.case_id);
+  }
+  return fired;
+}
+
 export interface SetupPatch {
   status?: SetupStatus;
   stepWhatsapp?: StepStatus;
