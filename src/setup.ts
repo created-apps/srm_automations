@@ -293,6 +293,21 @@ function splitName(full: string): { first: string; last: string } {
   return { first: parts.slice(0, -1).join(' '), last: parts[parts.length - 1]! };
 }
 
+/**
+ * COMP_AI country from a phone's dialling code. Phones are stored as bare
+ * digits with the country code (WhatsApp format), e.g. 919876543210.
+ * Note +1 also covers Canada, which therefore comes out as USA.
+ */
+function compAiCountryFromPhone(phone: string): cosmic.CompAiCountry {
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) return 'India';
+  if (digits.length === 11 && digits.startsWith('1')) return 'USA';
+  if (digits.length <= 10) {
+    throw new Error(`cosmic student: phone ${phone} has no country code, can't tell the COMP_AI country`);
+  }
+  return 'Worldwide';
+}
+
 function credentialsMessage(studentName: string, c: cosmic.Credentials): string {
   return (
     `Hi ${studentName}! For your project, we will be using the Learning Management System\n` +
@@ -312,6 +327,11 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
   const email = (c.studentEmail ?? '').trim();
   if (!email) throw new Error('cosmic student: case has no student email');
 
+  // COMP_AI country is compulsory; derive it from the student's phone, else the parent's.
+  const phoneForCountry = (c.studentPhone ?? '').trim() || (c.parentPhone ?? '').trim();
+  if (!phoneForCountry) throw new Error('cosmic student: case has no phone to derive the COMP_AI country from');
+  const compAiCountry = compAiCountryFromPhone(phoneForCountry);
+
   const { first, last } = splitName(c.studentName);
   const themes =
     s.curriculumSubject && s.curriculumSubject.toUpperCase() !== 'NONE'
@@ -321,6 +341,7 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
     first_name: first,
     last_name: last,
     email,
+    comp_ai_country: compAiCountry,
     ...(c.studentPhone ? { phone: c.studentPhone, whatsapp_phone: c.studentPhone } : {}),
     ...(c.parentName ? { parent_name: c.parentName } : {}),
     ...(c.parentEmail ? { parent_email: c.parentEmail } : {}),

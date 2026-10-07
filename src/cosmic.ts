@@ -103,10 +103,18 @@ async function call<T>(
 
 // --- Students --------------------------------------------------------------
 
+/**
+ * students.comp_ai_country -- the region COSMIC's competition matcher searches.
+ * The API treats it as optional, but a student without one is skipped by the
+ * auto-match sweep, so we always send it.
+ */
+export type CompAiCountry = 'India' | 'USA' | 'Worldwide';
+
 export interface StudentCreateInput {
   first_name: string;
   last_name: string;
   email: string;
+  comp_ai_country: CompAiCountry;
   phone?: string;
   whatsapp_phone?: string;
   parent_name?: string;
