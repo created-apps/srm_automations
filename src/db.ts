@@ -150,6 +150,25 @@ export async function findCaseById(id: string): Promise<GroupCase | null> {
 }
 
 // ---------------------------------------------------------------------------
+// intake_rows (read only) -- the sheet row a case was created from. Owned by
+// the intake service; `raw` holds every cell of the row, keyed by header.
+
+const PROGRAM_TYPE_COLUMN = 'Program Type(s)';
+
+/** The row's "Program Type(s)" cell (PPP / RBP / ...), or null if blank or no row. */
+export async function findProgramType(chatId: string): Promise<string | null> {
+  const params = new URLSearchParams({
+    select: 'raw',
+    chat_id: `eq.${chatId}`,
+    order: 'created_at.desc',
+    limit: '1',
+  });
+  const rows = await call<{ raw: Record<string, string> | null }[]>('GET', `/intake_rows?${params}`);
+  const value = (rows[0]?.raw?.[PROGRAM_TYPE_COLUMN] ?? '').trim();
+  return value || null;
+}
+
+// ---------------------------------------------------------------------------
 // project_setups (read/write) -- this service's state.
 
 export type SetupStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED';

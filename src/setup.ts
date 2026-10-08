@@ -332,6 +332,9 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
   if (!phoneForCountry) throw new Error('cosmic student: case has no phone to derive the COMP_AI country from');
   const compAiCountry = compAiCountryFromPhone(phoneForCountry);
 
+  // Programme (PPP / RBP) from the intake sheet's "Program Type(s)" column.
+  const programType = await db.findProgramType(c.chatId);
+
   const { first, last } = splitName(c.studentName);
   const themes =
     s.curriculumSubject && s.curriculumSubject.toUpperCase() !== 'NONE'
@@ -342,6 +345,7 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
     last_name: last,
     email,
     comp_ai_country: compAiCountry,
+    ...(programType ? { program_enrolled: programType } : {}),
     ...(c.studentPhone ? { phone: c.studentPhone, whatsapp_phone: c.studentPhone } : {}),
     ...(c.parentName ? { parent_name: c.parentName } : {}),
     ...(c.parentEmail ? { parent_email: c.parentEmail } : {}),

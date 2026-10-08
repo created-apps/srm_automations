@@ -115,6 +115,8 @@ export interface StudentCreateInput {
   last_name: string;
   email: string;
   comp_ai_country: CompAiCountry;
+  /** PPP / RBP -- drives how many competitions the student may select. */
+  program_enrolled?: string;
   phone?: string;
   whatsapp_phone?: string;
   parent_name?: string;
