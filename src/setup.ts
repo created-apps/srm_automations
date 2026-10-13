@@ -312,7 +312,7 @@ function credentialsMessage(studentName: string, c: cosmic.Credentials): string 
   return (
     `Hi ${studentName}! For your project, we will be using the Learning Management System\n` +
     `Login at ${config.cosmic.loginUrl}\n` +
-    `Username: ${c.username}\n` +
+    `Email: ${c.email}\n` +
     `Password: ${c.password}\n` +
     `Please change your password after your first login.`
   );
