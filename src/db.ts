@@ -77,6 +77,8 @@ export interface GroupCase {
   parentPhone: string | null;
   parentEmail: string | null;
   projectName: string | null;
+  programCode: 'PPP' | 'RBP' | 'CMP' | null;
+  pocOwnerId: string | null;
   stage: CaseStage;
   mentorName: string | null;
   /**
@@ -88,6 +90,10 @@ export interface GroupCase {
   mentorIntroSentAt: Date | null;
   /** The mentor's SYNC users.id, stamped at introduction. */
   mentorSyncUserId: string | null;
+  researchMentorName: string | null;
+  researchMentorSyncUserId: string | null;
+  researchMentorIntroSentAt: Date | null;
+  previousResearchMentorSyncUserId: string | null;
   /**
    * The dashboard's kill switch. Set means someone stopped this case: nothing
    * here may touch its WhatsApp group, Drive folder, SYNC or Cosmic records
@@ -107,15 +113,21 @@ interface GroupCaseRow {
   parent_phone: string | null;
   parent_email: string | null;
   project_name: string | null;
+  program_code: 'PPP' | 'RBP' | 'CMP' | null;
+  poc_owner_id: string | null;
   stage: CaseStage;
   mentor_name: string | null;
   mentor_intro_sent_at: string | null;
   mentor_sync_user_id: string | null;
+  research_mentor_name: string | null;
+  research_mentor_sync_user_id: string | null;
+  research_mentor_intro_sent_at: string | null;
+  previous_research_mentor_sync_user_id: string | null;
   operations_stopped_at: string | null;
 }
 
 const CASE_COLUMNS =
-  'id,chat_id,group_name,student_name,student_phone,student_email,parent_name,parent_phone,parent_email,project_name,stage,mentor_name,mentor_intro_sent_at,mentor_sync_user_id,operations_stopped_at';
+  'id,chat_id,group_name,student_name,student_phone,student_email,parent_name,parent_phone,parent_email,project_name,program_code,poc_owner_id,stage,mentor_name,mentor_intro_sent_at,mentor_sync_user_id,research_mentor_name,research_mentor_sync_user_id,research_mentor_intro_sent_at,previous_research_mentor_sync_user_id,operations_stopped_at';
 
 function toCase(row: GroupCaseRow): GroupCase {
   return {
@@ -129,10 +141,18 @@ function toCase(row: GroupCaseRow): GroupCase {
     parentPhone: row.parent_phone,
     parentEmail: row.parent_email,
     projectName: row.project_name,
+    programCode: row.program_code ?? null,
+    pocOwnerId: row.poc_owner_id ?? null,
     stage: row.stage,
     mentorName: row.mentor_name,
     mentorIntroSentAt: row.mentor_intro_sent_at ? new Date(row.mentor_intro_sent_at) : null,
     mentorSyncUserId: row.mentor_sync_user_id,
+    researchMentorName: row.research_mentor_name ?? null,
+    researchMentorSyncUserId: row.research_mentor_sync_user_id ?? null,
+    researchMentorIntroSentAt: row.research_mentor_intro_sent_at
+      ? new Date(row.research_mentor_intro_sent_at)
+      : null,
+    previousResearchMentorSyncUserId: row.previous_research_mentor_sync_user_id ?? null,
     operationsStoppedAt: row.operations_stopped_at
       ? new Date(row.operations_stopped_at)
       : null,
@@ -196,6 +216,23 @@ export interface ProjectSetup {
   cosmicStudentId: string | null;
   cosmicUserId: string | null;
   cosmicProjectId: string | null;
+  pocStatus: SetupStatus;
+  pocAttempts: number;
+  stepPocDrive: StepStatus;
+  stepPocDriveAccess: StepStatus;
+  stepCosmicPocProject: StepStatus;
+  cosmicPocProjectId: string | null;
+  pendingCosmicCredentials: {
+    username: string;
+    password: string;
+    email: string;
+  } | null;
+  cosmicCredentialsDeliveredAt: Date | null;
+  researchStatus: SetupStatus;
+  researchAttempts: number;
+  stepResearchDriveAccess: StepStatus;
+  stepCosmicResearchMentor: StepStatus;
+  appliedResearchMentorSyncUserId: string | null;
   attempts: number;
   lastError: string | null;
   lastRunAt: Date | null;
@@ -228,6 +265,23 @@ interface ProjectSetupRow {
   cosmic_student_id: string | null;
   cosmic_user_id: string | null;
   cosmic_project_id: string | null;
+  poc_status: SetupStatus;
+  poc_attempts: number;
+  step_poc_drive: StepStatus;
+  step_poc_drive_access: StepStatus;
+  step_cosmic_poc_project: StepStatus;
+  cosmic_poc_project_id: string | null;
+  pending_cosmic_credentials: {
+    username: string;
+    password: string;
+    email: string;
+  } | null;
+  cosmic_credentials_delivered_at: string | null;
+  research_status: SetupStatus;
+  research_attempts: number;
+  step_research_drive_access: StepStatus;
+  step_cosmic_research_mentor: StepStatus;
+  applied_research_mentor_sync_user_id: string | null;
   attempts: number;
   last_error: string | null;
   last_run_at: string | null;
@@ -261,6 +315,19 @@ function toSetup(row: ProjectSetupRow): ProjectSetup {
     cosmicStudentId: row.cosmic_student_id,
     cosmicUserId: row.cosmic_user_id,
     cosmicProjectId: row.cosmic_project_id,
+    pocStatus: row.poc_status,
+    pocAttempts: row.poc_attempts,
+    stepPocDrive: row.step_poc_drive,
+    stepPocDriveAccess: row.step_poc_drive_access,
+    stepCosmicPocProject: row.step_cosmic_poc_project,
+    cosmicPocProjectId: row.cosmic_poc_project_id,
+    pendingCosmicCredentials: row.pending_cosmic_credentials ?? null,
+    cosmicCredentialsDeliveredAt: date(row.cosmic_credentials_delivered_at),
+    researchStatus: row.research_status,
+    researchAttempts: row.research_attempts,
+    stepResearchDriveAccess: row.step_research_drive_access,
+    stepCosmicResearchMentor: row.step_cosmic_research_mentor,
+    appliedResearchMentorSyncUserId: row.applied_research_mentor_sync_user_id,
     attempts: row.attempts,
     lastError: row.last_error,
     lastRunAt: date(row.last_run_at),
@@ -297,13 +364,46 @@ export async function listRunnable(maxAttempts: number): Promise<ProjectSetup[]>
   // The embed is `!inner` purely to filter on the case: a stopped case's setup
   // must never be claimed, and an inner join is how PostgREST expresses that
   // in one request. Nothing reads the embedded columns -- toSetup ignores them.
-  params.set('select', '*,group_cases!inner(operations_stopped_at)');
+  params.set('select', '*,group_cases!inner(operations_stopped_at,program_code)');
   params.set('submitted_at', 'not.is.null');
   params.set('status', 'in.(PENDING,FAILED)');
   params.set('group_cases.operations_stopped_at', 'is.null');
+  params.set('group_cases.program_code', 'neq.CMP');
   if (maxAttempts > 0) params.set('attempts', `lt.${maxAttempts}`);
   params.set('order', 'submitted_at.asc');
 
+  const rows = await call<ProjectSetupRow[]>('GET', `/project_setups?${params}`);
+  return rows.map(toSetup);
+}
+
+/** Joined cases with a programme and POC, before the regular mentor gate. */
+export async function listPocBootstrapRunnable(maxAttempts: number): Promise<ProjectSetup[]> {
+  const params = new URLSearchParams();
+  params.set(
+    'select',
+    '*,group_cases!inner(stage,program_code,poc_owner_id,operations_stopped_at)'
+  );
+  params.set('poc_status', 'in.(PENDING,FAILED)');
+  params.set('group_cases.stage', 'neq.AWAITING_JOIN');
+  params.set('group_cases.program_code', 'not.is.null');
+  params.set('group_cases.poc_owner_id', 'not.is.null');
+  params.set('group_cases.operations_stopped_at', 'is.null');
+  if (maxAttempts > 0) params.set('poc_attempts', `lt.${maxAttempts}`);
+  params.set('order', 'updated_at.asc');
+  const rows = await call<ProjectSetupRow[]>('GET', `/project_setups?${params}`);
+  return rows.map(toSetup);
+}
+
+export async function listResearchRunnable(maxAttempts: number): Promise<ProjectSetup[]> {
+  const params = new URLSearchParams();
+  params.set('select', '*,group_cases!inner(program_code,research_mentor_intro_sent_at,operations_stopped_at)');
+  params.set('research_status', 'in.(PENDING,FAILED)');
+  params.set('cosmic_project_id', 'not.is.null');
+  params.set('group_cases.program_code', 'eq.RBP');
+  params.set('group_cases.research_mentor_intro_sent_at', 'not.is.null');
+  params.set('group_cases.operations_stopped_at', 'is.null');
+  if (maxAttempts > 0) params.set('research_attempts', `lt.${maxAttempts}`);
+  params.set('order', 'updated_at.asc');
   const rows = await call<ProjectSetupRow[]>('GET', `/project_setups?${params}`);
   return rows.map(toSetup);
 }
@@ -334,7 +434,7 @@ export async function listRunnable(maxAttempts: number): Promise<ProjectSetup[]>
  */
 export async function autoSubmitReady(): Promise<string[]> {
   const params = new URLSearchParams();
-  params.set('select', 'case_id,project_title,project_description,group_cases!inner(mentor_intro_sent_at,operations_stopped_at)');
+  params.set('select', 'case_id,project_title,project_description,group_cases!inner(mentor_intro_sent_at,operations_stopped_at,program_code)');
   params.set('submitted_at', 'is.null');
   params.set('status', 'in.(PENDING,FAILED)');
   params.set('project_title', 'not.is.null');
@@ -342,6 +442,7 @@ export async function autoSubmitReady(): Promise<string[]> {
   // The two case-side conditions: introduced, and not stopped.
   params.set('group_cases.mentor_intro_sent_at', 'not.is.null');
   params.set('group_cases.operations_stopped_at', 'is.null');
+  params.set('group_cases.program_code', 'neq.CMP');
 
   type Row = Pick<ProjectSetupRow, 'case_id' | 'project_title' | 'project_description'>;
   const rows = await call<Row[]>('GET', `/project_setups?${params}`);
@@ -382,6 +483,23 @@ export interface SetupPatch {
   cosmicStudentId?: string | null;
   cosmicUserId?: string | null;
   cosmicProjectId?: string | null;
+  pocStatus?: SetupStatus;
+  pocAttempts?: number;
+  stepPocDrive?: StepStatus;
+  stepPocDriveAccess?: StepStatus;
+  stepCosmicPocProject?: StepStatus;
+  cosmicPocProjectId?: string | null;
+  pendingCosmicCredentials?: {
+    username: string;
+    password: string;
+    email: string;
+  } | null;
+  cosmicCredentialsDeliveredAt?: Date | null;
+  researchStatus?: SetupStatus;
+  researchAttempts?: number;
+  stepResearchDriveAccess?: StepStatus;
+  stepCosmicResearchMentor?: StepStatus;
+  appliedResearchMentorSyncUserId?: string | null;
   attempts?: number;
   lastError?: string | null;
   lastRunAt?: Date | null;
@@ -415,6 +533,19 @@ export async function updateSetup(
   set('cosmic_student_id', patch.cosmicStudentId);
   set('cosmic_user_id', patch.cosmicUserId);
   set('cosmic_project_id', patch.cosmicProjectId);
+  set('poc_status', patch.pocStatus);
+  set('poc_attempts', patch.pocAttempts);
+  set('step_poc_drive', patch.stepPocDrive);
+  set('step_poc_drive_access', patch.stepPocDriveAccess);
+  set('step_cosmic_poc_project', patch.stepCosmicPocProject);
+  set('cosmic_poc_project_id', patch.cosmicPocProjectId);
+  set('pending_cosmic_credentials', patch.pendingCosmicCredentials);
+  set('cosmic_credentials_delivered_at', patch.cosmicCredentialsDeliveredAt);
+  set('research_status', patch.researchStatus);
+  set('research_attempts', patch.researchAttempts);
+  set('step_research_drive_access', patch.stepResearchDriveAccess);
+  set('step_cosmic_research_mentor', patch.stepCosmicResearchMentor);
+  set('applied_research_mentor_sync_user_id', patch.appliedResearchMentorSyncUserId);
   set('attempts', patch.attempts);
   set('last_error', patch.lastError);
   set('last_run_at', patch.lastRunAt);
@@ -450,6 +581,44 @@ export async function claimForRun(
         status: 'RUNNING',
         attempts: attempts + 1,
         last_run_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      prefer: 'return=representation',
+    }
+  );
+  return rows[0] ? toSetup(rows[0]) : null;
+}
+
+export async function claimPocBootstrap(
+  caseId: string,
+  attempts: number
+): Promise<ProjectSetup | null> {
+  const rows = await call<ProjectSetupRow[]>(
+    'PATCH',
+    `/project_setups?case_id=eq.${encodeURIComponent(caseId)}&poc_status=in.(PENDING,FAILED)`,
+    {
+      body: {
+        poc_status: 'RUNNING',
+        poc_attempts: attempts + 1,
+        updated_at: new Date().toISOString(),
+      },
+      prefer: 'return=representation',
+    }
+  );
+  return rows[0] ? toSetup(rows[0]) : null;
+}
+
+export async function claimResearchRun(
+  caseId: string,
+  attempts: number
+): Promise<ProjectSetup | null> {
+  const rows = await call<ProjectSetupRow[]>(
+    'PATCH',
+    `/project_setups?case_id=eq.${encodeURIComponent(caseId)}&research_status=in.(PENDING,FAILED)`,
+    {
+      body: {
+        research_status: 'RUNNING',
+        research_attempts: attempts + 1,
         updated_at: new Date().toISOString(),
       },
       prefer: 'return=representation',

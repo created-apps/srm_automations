@@ -172,6 +172,11 @@ export async function resolveMentor(name: string): Promise<ResolvedMentor | null
   return matches.length === 1 ? matches[0]! : null;
 }
 
+export async function findMentorById(id: string): Promise<ResolvedMentor | null> {
+  if (!config.sync.configured) return null;
+  return (await allMentors()).find((mentor) => mentor.id === id) ?? null;
+}
+
 /**
  * Why a mentor couldn't be resolved, in words worth putting in front of a
  * person. Only called on the failure path, so the extra request is fine.

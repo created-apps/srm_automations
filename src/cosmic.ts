@@ -64,7 +64,7 @@ async function accessToken(force = false): Promise<string> {
 }
 
 async function call<T>(
-  method: 'GET' | 'POST' | 'PATCH',
+  method: 'GET' | 'POST' | 'PATCH' | 'PUT',
   pathname: string,
   init: { body?: unknown; retryAuth?: boolean } = {}
 ): Promise<T> {
@@ -205,6 +205,7 @@ export async function findMentorId(opts: {
 export interface ProjectCreateInput {
   mentor_id?: string;
   student_id: string;
+  poc_owner_id: string;
   project_name: string;
   project_description?: string;
   project_track?: string;
@@ -216,6 +217,41 @@ export interface ProjectCreateInput {
 export async function createProject(input: ProjectCreateInput): Promise<{ id: string }> {
   const row = await call<{ id: string }>('POST', '/projects/', { body: input });
   return { id: row.id };
+}
+
+export async function findCmpProject(
+  studentId: string,
+  syncGroupId: string,
+  pocOwnerId: string
+): Promise<{ id: string; poc_owner_id: string | null; sync_group_id: string | null } | null> {
+  const rows = await call<Array<{
+    id: string;
+    student_id: string;
+    mentor_id?: string | null;
+    poc_owner_id?: string | null;
+    sync_group_id?: string | null;
+  }>>('GET', '/projects/');
+
+  const candidates = rows.filter(
+    (row) =>
+      row.student_id === studentId &&
+      !row.mentor_id
+  );
+  // Prefer the fully linked row. The unlinked fallback recovers a crash after
+  // project creation but before the SYNC group PATCH, without making a second
+  // CMP project for the student.
+  const hit =
+    candidates.find((row) => row.sync_group_id === syncGroupId) ??
+    candidates.find((row) => !row.sync_group_id && row.poc_owner_id === pocOwnerId) ??
+    candidates.find((row) => !row.sync_group_id && !row.poc_owner_id) ??
+    candidates.find((row) => !row.sync_group_id);
+  return hit
+    ? {
+        id: hit.id,
+        poc_owner_id: hit.poc_owner_id ?? null,
+        sync_group_id: hit.sync_group_id ?? null,
+      }
+    : null;
 }
 
 /**
@@ -231,5 +267,88 @@ export async function setProjectSyncGroup(
 ): Promise<void> {
   await call('PATCH', `/projects/${encodeURIComponent(projectId)}/sync-group`, {
     body: { sync_group_id: syncGroupId, ...(groupJid ? { group_jid: groupJid } : {}) },
+  });
+}
+
+// --- POC projects ---------------------------------------------------------
+
+export interface PocOwner {
+  id: string;
+  name: string;
+  email: string | null;
+  actualEmail: string | null;
+}
+
+export async function findPocOwner(id: string): Promise<PocOwner | null> {
+  const rows = await call<Array<{
+    id: string;
+    name: string;
+    email?: string | null;
+    actual_email?: string | null;
+    active?: boolean;
+  }>>('GET', '/poc-owners/');
+  const hit = rows.find((row) => row.id === id && row.active !== false);
+  return hit
+    ? {
+        id: hit.id,
+        name: hit.name,
+        email: hit.email ?? null,
+        actualEmail: hit.actual_email ?? null,
+      }
+    : null;
+}
+
+export async function createPocProject(input: {
+  poc_owner_id: string;
+  student_id: string;
+  sync_group_id: string;
+  project_name: string;
+  project_track: 'product' | 'product_research';
+}): Promise<{ id: string }> {
+  const row = await call<{ id: string }>('POST', '/poc-projects/', { body: input });
+  return { id: row.id };
+}
+
+export async function findPocProject(
+  studentId: string,
+  syncGroupId: string
+): Promise<{ id: string; poc_owner_id: string | null } | null> {
+  const rows = await call<Array<{
+    id: string;
+    student_id: string;
+    sync_group_id: string;
+    poc_owner_id?: string | null;
+  }>>(
+    'GET',
+    '/poc-projects/'
+  );
+  const hit = rows.find((row) => row.student_id === studentId && row.sync_group_id === syncGroupId);
+  return hit ? { id: hit.id, poc_owner_id: hit.poc_owner_id ?? null } : null;
+}
+
+export async function setPocProjectOwner(
+  pocProjectId: string,
+  pocOwnerId: string
+): Promise<void> {
+  await call('PUT', `/poc-projects/${encodeURIComponent(pocProjectId)}`, {
+    body: { poc_owner_id: pocOwnerId },
+  });
+}
+
+export async function setProjectPocOwner(
+  projectId: string,
+  pocOwnerId: string
+): Promise<void> {
+  await call('PATCH', `/projects/${encodeURIComponent(projectId)}/poc-owner`, {
+    body: { poc_owner_id: pocOwnerId },
+  });
+}
+
+export async function replaceProjectMentor(
+  projectId: string,
+  mentorId: string
+): Promise<void> {
+  await call('PATCH', `/projects/${encodeURIComponent(projectId)}/mentor`, {
+    body: { mentor_id: mentorId },
   });
 }

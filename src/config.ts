@@ -140,7 +140,6 @@ export const config = {
     adminEmail: cosmicEmail,
     adminPassword: cosmicPassword,
     // "fixed default" per the spec: product | research | product_research.
-    projectTrack: optional('COSMIC_PROJECT_TRACK') || 'product',
     // Project runs from today for this many weeks (end_date).
     durationWeeks: num('COSMIC_PROJECT_DURATION_WEEKS', 12),
     // Where students log in -- included in the credentials message.

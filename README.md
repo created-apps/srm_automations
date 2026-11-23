@@ -12,19 +12,19 @@ case automatically:
 3. **Add the mentor on SYNC**, ensuring student, parent and mentor are linked.
 4. **Give the mentor editor access** to that Drive folder.
 5. **Put the Drive link** into the WhatsApp group description.
-6. **Create the student account in COSMIC LMS** and send the generated login
-   into the WhatsApp group.
-7. **Create the project in COSMIC LMS**, linked to that student and (if matched)
-   the mentor, and **link it to the SYNC group**.
+6. Once the family is welcomed, the programme is known and the POC is assigned,
+   **create the Cosmic student and POC project**, then send the generated login.
+7. For PPP/RBP, **create the regular Cosmic project** only after the mentor is
+   introduced and title + description exist, then link it to the SYNC group.
 8. **Copy the relevant curriculum** (AI, Bio, CS, …) into the Drive folder.
 
-## Two gates, not one
+## Independent gates
 
 Step 1 is not gated on a mentor. Naming the group and giving it a description
 only needs the project details, which land as soon as the brainstorm is done —
-often well before a mentor exists. Everything from step 2 on genuinely needs the
-mentor, and waits for the introduction to have actually gone out
-(`group_cases.mentor_intro_sent_at`, not the coarser `stage`).
+often well before a mentor exists. The POC bootstrap also runs before the mentor
+gate. Regular Drive/SYNC/project work waits for the introduction to have
+actually gone out (`group_cases.mentor_intro_sent_at`, not the coarser `stage`).
 
 A step whose gate isn't open is **BLOCKED**: it stays PENDING, the run stops
 there, and the case is picked up again next tick. Blocking is not a failure and
@@ -124,7 +124,8 @@ This is why curriculum runs last — a hold there must not delay COSMIC.
 - **Shared Supabase** (same project as `assessment-automations` / `Automations`):
   reads `public.group_cases`, owns `public.project_setups`
   (`sql/001_project_setup.sql`, plus `002_cosmic.sql` and
-  `003_sheet_details_and_mentor_access.sql`). Run each once in the Supabase editor.
+  `003_sheet_details_and_mentor_access.sql` and
+  `004_programme_poc_research.sql`). Run each once in the Supabase editor.
 - **SYNC Supabase** (separate project): step 2 writes the mentor link here.
 - **Periskope**: `POST /chats/{chat_id}/settings` to edit the group.
 - **Google Drive**: a service account operating in a Shared Drive.
@@ -163,13 +164,23 @@ account must be **super_admin**), creates the student (`POST /students/`),
 **approves the account so the student can log in** (`PATCH
 /user_approval/approve/{user_id}`, 409 = already approved), and creates the
 project (`POST /projects/`). The student's generated password is returned only
-on create, so it is posted straight into the WhatsApp group (Slack fallback if
+on create, so the early POC lane holds it until the POC project exists, sends
+it into the WhatsApp group, then clears the temporary value (Slack fallback if
 that send fails). On a duplicate email the existing student is recovered via
 `GET /students/` so the project step can still run (credentials aren't re-sent).
 The project's `mentor_id` is resolved by matching the mentor's SYNC email (then
 name) against `GET /mentors/`; an unmatched mentor doesn't block the project.
-`project_track` is a fixed default, `start_date` is today and `end_date` is
-`+COSMIC_PROJECT_DURATION_WEEKS`. Unset COSMIC config and both steps are SKIPPED.
+The regular `project_track` starts as `product` for PPP and `product_research`
+for RBP. After an RBP research mentor joins and is introduced, the Cosmic
+handoff changes the regular project to `research`; Cosmic archives the
+completed original milestone generation and creates fresh research milestones.
+CMP has no regular project. `start_date` is today and `end_date` is
+`+COSMIC_PROJECT_DURATION_WEEKS`. Unset Cosmic config skips these steps.
+
+POC Drive access uses `poc_owners.actual_email`, not the notification/login
+address in `poc_owners.email`. The actual address must be a shareable Google
+Workspace account; a missing `actual_email` leaves the POC bootstrap failed
+with an explicit error rather than attempting to share to an alias.
 
 Run `sql/002_cosmic.sql` once to add the tracking columns.
 

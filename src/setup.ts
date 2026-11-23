@@ -146,9 +146,7 @@ async function stepSync(c: GroupCase): Promise<StepOutcome> {
   return result.skipped ? { status: 'SKIPPED', note: result.reason } : { status: 'OK' };
 }
 
-async function stepDrive(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
-  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
-
+async function ensureDrive(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
   // Reuse the folder from a prior attempt so a retry never makes a second one.
   let folderId = s.driveFolderId;
   if (!folderId) {
@@ -196,6 +194,11 @@ async function stepDrive(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
     }
   }
   return { status: 'OK', note: notes.join('; ') || undefined };
+}
+
+async function stepDrive(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
+  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
+  return ensureDrive(c, s);
 }
 
 /**
@@ -318,11 +321,29 @@ function credentialsMessage(studentName: string, c: cosmic.Credentials): string 
   );
 }
 
-/** Step 5 -- create the student in COSMIC and send their login to the group. */
-async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
-  if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
-  if (!cosmic.cosmicConfigured()) return { status: 'SKIPPED', note: 'COSMIC not configured' };
-  if (s.cosmicStudentId) return { status: 'OK' }; // created on a prior attempt
+interface CosmicStudentStep {
+  outcome: StepOutcome;
+  credentials?: cosmic.Credentials;
+}
+
+/** Create/resolve the COSMIC student. Credential delivery can be delayed until
+ * the POC project exists, which is the new-student bootstrap contract. */
+async function ensureCosmicStudent(
+  c: GroupCase,
+  s: ProjectSetup,
+  deliverCredentials: boolean
+): Promise<CosmicStudentStep> {
+  if (!cosmic.cosmicConfigured()) {
+    return { outcome: { status: 'SKIPPED', note: 'COSMIC not configured' } };
+  }
+  if (s.cosmicStudentId) {
+    return {
+      outcome: { status: 'OK' },
+      ...(!deliverCredentials && s.pendingCosmicCredentials
+        ? { credentials: s.pendingCosmicCredentials }
+        : {}),
+    };
+  }
 
   const email = (c.studentEmail ?? '').trim();
   if (!email) throw new Error('cosmic student: case has no student email');
@@ -332,8 +353,7 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
   if (!phoneForCountry) throw new Error('cosmic student: case has no phone to derive the COMP_AI country from');
   const compAiCountry = compAiCountryFromPhone(phoneForCountry);
 
-  // Programme (PPP / RBP) from the intake sheet's "Program Type(s)" column.
-  const programType = await db.findProgramType(c.chatId);
+  if (!c.programCode) throw new Error('cosmic student: programme has not been selected');
 
   const { first, last } = splitName(c.studentName);
   const themes =
@@ -345,7 +365,7 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
     last_name: last,
     email,
     comp_ai_country: compAiCountry,
-    ...(programType ? { program_enrolled: programType } : {}),
+    program_enrolled: c.programCode,
     ...(c.studentPhone ? { phone: c.studentPhone, whatsapp_phone: c.studentPhone } : {}),
     ...(c.parentName ? { parent_name: c.parentName } : {}),
     ...(c.parentEmail ? { parent_email: c.parentEmail } : {}),
@@ -377,21 +397,21 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
           cosmicStudentId: existing.id,
           cosmicUserId: existing.user_id || null,
         });
-        // Make sure they can log in even if a prior attempt left them unverified.
-        if (existing.user_id) await cosmic.verifyUser(existing.user_id);
-        return { status: 'OK', note: 'student already existed in COSMIC (credentials not re-sent)' };
+        console.log(`[${s.caseId}] COSMIC student ${email} already exists -- credentials unchanged`);
+        return { outcome: { status: 'OK', note: 'student already existed in COSMIC (credentials not re-sent)' } };
       }
       // Email is taken by a non-student user: nothing to attach. Skip the two
       // downstream COSMIC steps too, so the case still finishes DONE.
       await db.updateSetup(s.caseId, {
         stepCosmicProject: 'SKIPPED',
         stepCosmicSyncGroup: 'SKIPPED',
+        stepCosmicPocProject: 'SKIPPED',
       });
       await slack.postNote(
         `:warning: COSMIC account skipped for ${c.studentName}: ${email} already belongs to a ` +
           `non-student COSMIC user (mentor/staff/counsellor). No student or project was created.`
       );
-      return { status: 'SKIPPED', note: `${email} belongs to a non-student COSMIC user` };
+      return { outcome: { status: 'SKIPPED', note: `${email} belongs to a non-student COSMIC user` } };
     }
     throw err;
   }
@@ -400,12 +420,15 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
   await db.updateSetup(s.caseId, {
     cosmicStudentId: created.id,
     cosmicUserId: created.user_id,
+    ...(!deliverCredentials && created.credentials
+      ? { pendingCosmicCredentials: created.credentials }
+      : {}),
   });
 
   // Approve/verify the account so the student can actually log in.
   await cosmic.verifyUser(created.user_id);
 
-  if (created.credentials) {
+  if (deliverCredentials && created.credentials) {
     try {
       await periskope.sendMessage(c.chatId, credentialsMessage(c.studentName, created.credentials));
     } catch (err) {
@@ -415,17 +438,39 @@ async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOut
         `:key: COSMIC login for ${c.studentName} (WhatsApp send failed: ${m}) -- ` +
           `username: ${created.credentials.username}, password: ${created.credentials.password}`
       );
-      return { status: 'OK', note: 'credentials delivered to Slack (WhatsApp send failed)' };
+      return { outcome: { status: 'OK', note: 'credentials delivered to Slack (WhatsApp send failed)' } };
     }
   }
-  return { status: 'OK' };
+  return { outcome: { status: 'OK' }, credentials: created.credentials };
+}
+
+async function stepCosmicStudent(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
+  // New accounts belong to the early POC lane: that is what guarantees the
+  // one-time password is not sent until the POC project exists. The regular
+  // lane only observes the completed/skipped result.
+  if (!c.pocOwnerId || (s.stepCosmicPocProject !== 'OK' && s.stepCosmicPocProject !== 'SKIPPED')) {
+    return { status: 'BLOCKED', note: 'waiting for POC owner and POC project bootstrap' };
+  }
+  if (s.cosmicStudentId) return { status: 'OK' };
+  return { status: 'SKIPPED', note: 'POC bootstrap did not create a COSMIC student' };
 }
 
 /** Step 6 -- create the project in COSMIC, linked to the student and mentor. */
 async function stepCosmicProject(c: GroupCase, s: ProjectSetup): Promise<StepOutcome> {
   if (!mentorReady(c)) return { status: 'BLOCKED', note: WAITING_FOR_MENTOR };
+  if (c.programCode === 'CMP') return { status: 'SKIPPED', note: 'CMP has no regular mentor project' };
+  if (!c.pocOwnerId) return { status: 'BLOCKED', note: 'waiting for POC owner' };
+  if (!(s.projectTitle ?? '').trim() || !(s.projectDescription ?? '').trim()) {
+    return { status: 'BLOCKED', note: 'waiting for project title and description' };
+  }
   if (!cosmic.cosmicConfigured()) return { status: 'SKIPPED', note: 'COSMIC not configured' };
-  if (s.cosmicProjectId) return { status: 'OK' };
+  if (s.cosmicProjectId) {
+    // A retry may resume after the project id was saved but before the step
+    // completed. Re-apply the authoritative case owner so such rows are not
+    // left invisible on the POC dashboard.
+    await cosmic.setProjectPocOwner(s.cosmicProjectId, c.pocOwnerId);
+    return { status: 'OK' };
+  }
   if (!s.cosmicStudentId) throw new Error('cosmic project: no student id (student step must run first)');
 
   const title = (s.projectTitle ?? '').trim() || c.groupName;
@@ -458,9 +503,10 @@ async function stepCosmicProject(c: GroupCase, s: ProjectSetup): Promise<StepOut
   const created = await cosmic.createProject({
     mentor_id: mentorId,
     student_id: s.cosmicStudentId,
+    poc_owner_id: c.pocOwnerId,
     project_name: title,
     ...(s.projectDescription ? { project_description: s.projectDescription } : {}),
-    project_track: config.cosmic.projectTrack,
+    project_track: c.programCode === 'RBP' ? 'product_research' : 'product',
     status: 'not_started',
     start_date: ymd(start),
     end_date: ymd(end),
@@ -481,6 +527,222 @@ async function stepCosmicSyncGroup(c: GroupCase, s: ProjectSetup): Promise<StepO
 
   await cosmic.setProjectSyncGroup(s.cosmicProjectId, groupId, c.chatId);
   return { status: 'OK' };
+}
+
+async function deliverCredentialsAfterPocProject(
+  c: GroupCase,
+  credentials: cosmic.Credentials
+): Promise<void> {
+  try {
+    await periskope.sendMessage(c.chatId, credentialsMessage(c.studentName, credentials));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await slack.postNote(
+      `:key: COSMIC login for ${c.studentName} (WhatsApp send failed: ${message}) -- ` +
+        `username: ${credentials.username}, password: ${credentials.password}`
+    );
+  }
+}
+
+/**
+ * The early, programme-independent POC bootstrap. It runs after the family is
+ * welcomed and a POC is chosen, without waiting for a regular mentor or the
+ * real project's title/description.
+ */
+export async function runPocBootstrap(caseId: string): Promise<void> {
+  const c = await db.findCaseById(caseId);
+  let s = await db.findSetup(caseId);
+  if (!c || !s) throw new Error(`POC bootstrap state missing for ${caseId}`);
+  if (!c.programCode || !c.pocOwnerId || c.stage === 'AWAITING_JOIN') {
+    await db.updateSetup(caseId, { pocStatus: 'PENDING', pocAttempts: 0 });
+    return;
+  }
+  if (c.operationsStoppedAt) {
+    await db.updateSetup(caseId, { pocStatus: 'PENDING' });
+    return;
+  }
+
+  let credentials: cosmic.Credentials | undefined;
+  try {
+    if (s.stepPocDrive !== 'OK' && s.stepPocDrive !== 'SKIPPED') {
+      const outcome = await ensureDrive(c, s);
+      if (outcome.status === 'BLOCKED') throw new Error(outcome.note);
+      s = await db.updateSetup(caseId, { stepPocDrive: outcome.status, lastError: null });
+    }
+
+    if (s.stepCosmicStudent !== 'OK' && s.stepCosmicStudent !== 'SKIPPED') {
+      const student = await ensureCosmicStudent(c, s, false);
+      credentials = student.credentials;
+      if (student.outcome.status === 'BLOCKED') throw new Error(student.outcome.note);
+      s = await db.updateSetup(caseId, {
+        stepCosmicStudent: student.outcome.status,
+        ...(student.outcome.status === 'SKIPPED'
+          ? { stepCosmicPocProject: 'SKIPPED' as const }
+          : {}),
+        lastError: null,
+      });
+    }
+
+    if (s.stepCosmicPocProject !== 'OK' && s.stepCosmicPocProject !== 'SKIPPED') {
+      if (!s.cosmicStudentId) throw new Error('POC project: no COSMIC student id');
+      if (!sync.syncConfigured()) throw new Error('POC project: SYNC is not configured');
+      const groupId = await sync.findGroupIdByJid(c.chatId);
+      if (!groupId) throw new Error(`POC project: no SYNC group for JID ${c.chatId}`);
+
+      let project: { id: string };
+      if (c.programCode === 'CMP') {
+        // New CMP engagements are ordinary projects (with no mentor or
+        // milestones). Keep recognizing an existing legacy poc_projects row
+        // so this rollout does not migrate or duplicate old students.
+        const existing = await cosmic.findCmpProject(
+          s.cosmicStudentId,
+          groupId,
+          c.pocOwnerId
+        );
+        const legacy = existing
+          ? null
+          : await cosmic.findPocProject(s.cosmicStudentId, groupId);
+
+        if (legacy) {
+          if (legacy.poc_owner_id && legacy.poc_owner_id !== c.pocOwnerId) {
+            throw new Error(
+              `Legacy CMP POC project ${legacy.id} belongs to a different Cosmic POC owner`
+            );
+          }
+          if (!legacy.poc_owner_id) {
+            await cosmic.setPocProjectOwner(legacy.id, c.pocOwnerId);
+          }
+          project = legacy;
+        } else {
+          if (existing?.poc_owner_id && existing.poc_owner_id !== c.pocOwnerId) {
+            throw new Error(
+              `CMP project ${existing.id} belongs to a different Cosmic POC owner`
+            );
+          }
+          project = existing ?? await cosmic.createProject({
+            student_id: s.cosmicStudentId,
+            poc_owner_id: c.pocOwnerId,
+            project_name: `CreatED X ${c.studentName}: Custom Project`,
+            project_track: 'product',
+            status: 'not_started',
+          });
+
+          // Persist before linking. If the SYNC check fails or this process is
+          // restarted, the next run reuses the same unlinked project.
+          if (s.cosmicPocProjectId !== project.id) {
+            s = await db.updateSetup(caseId, { cosmicPocProjectId: project.id });
+          }
+          if (!existing?.poc_owner_id) {
+            await cosmic.setProjectPocOwner(project.id, c.pocOwnerId);
+          }
+          if (existing?.sync_group_id !== groupId) {
+            await cosmic.setProjectSyncGroup(project.id, groupId);
+          }
+        }
+      } else {
+        const existing = await cosmic.findPocProject(s.cosmicStudentId, groupId);
+        if (existing?.poc_owner_id && existing.poc_owner_id !== c.pocOwnerId) {
+          throw new Error(
+            `POC project ${existing.id} already belongs to a different Cosmic POC owner`
+          );
+        }
+        if (existing && !existing.poc_owner_id) {
+          await cosmic.setPocProjectOwner(existing.id, c.pocOwnerId);
+        }
+        project = existing ?? await cosmic.createPocProject({
+          poc_owner_id: c.pocOwnerId,
+          student_id: s.cosmicStudentId,
+          sync_group_id: groupId,
+          project_name: `CreatED X ${c.studentName}: Custom Project`,
+          project_track: c.programCode === 'RBP' ? 'product_research' : 'product',
+        });
+      }
+      s = await db.updateSetup(caseId, {
+        cosmicPocProjectId: project.id,
+        stepCosmicPocProject: 'OK',
+        lastError: null,
+      });
+    }
+
+    credentials = credentials ?? s.pendingCosmicCredentials ?? undefined;
+    if (s.stepCosmicPocProject === 'OK' && credentials && !s.cosmicCredentialsDeliveredAt) {
+      await deliverCredentialsAfterPocProject(c, credentials);
+      s = await db.updateSetup(caseId, {
+        pendingCosmicCredentials: null,
+        cosmicCredentialsDeliveredAt: new Date(),
+        lastError: null,
+      });
+    }
+
+    if (s.stepPocDriveAccess !== 'OK' && s.stepPocDriveAccess !== 'SKIPPED') {
+      if (!s.driveFolderId) throw new Error('POC Drive access: no Drive folder');
+      const owner = await cosmic.findPocOwner(c.pocOwnerId);
+      if (!owner) throw new Error(`POC Drive access: Cosmic owner ${c.pocOwnerId} not found`);
+      const actualEmail = (owner.actualEmail ?? '').trim();
+      if (!actualEmail) {
+        throw new Error(`POC Drive access: ${owner.name} has no actual_email`);
+      }
+      await drive.grantAccess(s.driveFolderId, actualEmail, 'writer');
+      s = await db.updateSetup(caseId, { stepPocDriveAccess: 'OK', lastError: null });
+    }
+
+    await db.updateSetup(caseId, { pocStatus: 'DONE', pocAttempts: 0, lastError: null });
+    console.log(`[${caseId}] POC bootstrap DONE (${c.programCode})`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await db.updateSetup(caseId, { pocStatus: 'FAILED', lastError: `poc bootstrap: ${message}` });
+    await slack.postNote(`:warning: POC bootstrap failed for <${slack.caseLink(caseId)}> (${c.studentName}): ${message}`);
+  }
+}
+
+/** Apply an introduced RBP research mentor to Drive and the real Cosmic project. */
+export async function runResearchMentorSetup(caseId: string): Promise<void> {
+  const c = await db.findCaseById(caseId);
+  let s = await db.findSetup(caseId);
+  if (!c || !s) throw new Error(`research mentor state missing for ${caseId}`);
+  if (c.programCode !== 'RBP' || !c.researchMentorIntroSentAt || !c.researchMentorSyncUserId) {
+    await db.updateSetup(caseId, { researchStatus: 'PENDING', researchAttempts: 0 });
+    return;
+  }
+
+  try {
+    const mentor = await sync.findMentorById(c.researchMentorSyncUserId);
+    if (!mentor) throw new Error(`research mentor ${c.researchMentorSyncUserId} not found on SYNC`);
+
+    if (s.stepResearchDriveAccess !== 'OK') {
+      if (!s.driveFolderId) throw new Error('research mentor Drive access: no Drive folder');
+      if (!mentor.email) throw new Error(`${mentor.name} has no email for Drive access`);
+      await drive.grantAccess(s.driveFolderId, mentor.email, 'writer');
+      if (
+        c.previousResearchMentorSyncUserId &&
+        c.previousResearchMentorSyncUserId !== c.mentorSyncUserId &&
+        c.previousResearchMentorSyncUserId !== c.researchMentorSyncUserId
+      ) {
+        const previous = await sync.findMentorById(c.previousResearchMentorSyncUserId);
+        if (previous?.email) await drive.revokeAccess(s.driveFolderId, previous.email);
+      }
+      s = await db.updateSetup(caseId, { stepResearchDriveAccess: 'OK', lastError: null });
+    }
+
+    if (s.stepCosmicResearchMentor !== 'OK') {
+      if (!s.cosmicProjectId) throw new Error('research mentor: real Cosmic project does not exist yet');
+      const cosmicMentorId = await cosmic.findMentorId({ email: mentor.email, name: mentor.name });
+      if (!cosmicMentorId) throw new Error(`no Cosmic mentor matches ${mentor.name}`);
+      await cosmic.replaceProjectMentor(s.cosmicProjectId, cosmicMentorId);
+      s = await db.updateSetup(caseId, {
+        stepCosmicResearchMentor: 'OK',
+        appliedResearchMentorSyncUserId: c.researchMentorSyncUserId,
+        lastError: null,
+      });
+    }
+
+    await db.updateSetup(caseId, { researchStatus: 'DONE', researchAttempts: 0, lastError: null });
+    console.log(`[${caseId}] RBP research mentor applied: ${mentor.name}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await db.updateSetup(caseId, { researchStatus: 'FAILED', lastError: `research mentor: ${message}` });
+    await slack.postNote(`:warning: Research mentor setup failed for <${slack.caseLink(caseId)}> (${c.studentName}): ${message}`);
+  }
 }
 
 // --- orchestration ---------------------------------------------------------
@@ -669,6 +931,24 @@ export async function runCase(caseId: string): Promise<void> {
  * RUNNING), and run it. Claiming is what stops two ticks running the same case.
  */
 export async function reconcileOnce(): Promise<{ ran: number }> {
+  let ran = 0;
+
+  const pocRunnable = await db.listPocBootstrapRunnable(config.setup.maxAttempts);
+  for (const s of pocRunnable) {
+    const claimed = await db.claimPocBootstrap(s.caseId, s.pocAttempts);
+    if (!claimed) continue;
+    await runPocBootstrap(s.caseId);
+    ran++;
+  }
+
+  const researchRunnable = await db.listResearchRunnable(config.setup.maxAttempts);
+  for (const s of researchRunnable) {
+    const claimed = await db.claimResearchRun(s.caseId, s.researchAttempts);
+    if (!claimed) continue;
+    await runResearchMentorSetup(s.caseId);
+    ran++;
+  }
+
   // Before looking at the working set, let in the cases that are plainly ready
   // but that nobody submitted -- a complete title and description with the
   // mentor already introduced. They join the same pass; see db.autoSubmitReady.
@@ -683,7 +963,6 @@ export async function reconcileOnce(): Promise<{ ran: number }> {
   }
 
   const runnable = await db.listRunnable(config.setup.maxAttempts);
-  let ran = 0;
   for (const s of runnable) {
     const claimed = await db.claimForRun(s.caseId, s.attempts);
     if (!claimed) continue; // someone else got it

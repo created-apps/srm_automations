@@ -25,10 +25,37 @@ export class DriveError extends Error {
   }
 }
 
+/**
+ * Drive's own guidance for 429 and 5xx (including the bare "Internal Error"
+ * 500 it returns now and then on a copy) is to back off and try again, so a
+ * call makes up to RETRIES extra attempts before the error reaches the step.
+ */
+const RETRIES = 4;
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+
 async function call<T>(
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'DELETE',
   pathname: string,
   init: { query?: Record<string, string>; body?: unknown } = {}
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await callOnce<T>(method, pathname, init);
+    } catch (err) {
+      if (!(err instanceof DriveError) || !RETRYABLE.has(err.status) || attempt >= RETRIES) {
+        throw err;
+      }
+      const delay = 1000 * 2 ** attempt + Math.random() * 500;
+      console.warn(`${err.message.split(':')[0]}; retrying in ${Math.round(delay)}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
+async function callOnce<T>(
+  method: 'GET' | 'POST' | 'DELETE',
+  pathname: string,
+  init: { query?: Record<string, string>; body?: unknown }
 ): Promise<T> {
   const token = await accessToken();
   const query = new URLSearchParams({
@@ -104,6 +131,21 @@ export async function grantAccess(
   });
 }
 
+/** Remove a direct user permission by email; absent access is already done. */
+export async function revokeAccess(fileId: string, email: string): Promise<void> {
+  const page = await call<{
+    permissions?: Array<{ id: string; emailAddress?: string; type?: string }>;
+  }>('GET', `/files/${encodeURIComponent(fileId)}/permissions`, {
+    query: { fields: 'permissions(id,emailAddress,type)' },
+  });
+  const target = email.trim().toLowerCase();
+  const permission = (page.permissions ?? []).find(
+    (row) => row.type === 'user' && (row.emailAddress ?? '').trim().toLowerCase() === target
+  );
+  if (!permission) return;
+  await call('DELETE', `/files/${encodeURIComponent(fileId)}/permissions/${encodeURIComponent(permission.id)}`);
+}
+
 /** List the direct children of a folder (non-trashed). */
 async function listChildren(folderId: string): Promise<DriveFile[]> {
   const out: DriveFile[] = [];
@@ -139,17 +181,32 @@ async function copyFile(fileId: string, name: string, destParentId: string): Pro
  * Recursively copy the CONTENTS of `sourceFolderId` into `destFolderId`:
  * files are copied; sub-folders are recreated and their contents copied in
  * turn. Drive has no server-side recursive folder copy, so we walk the tree.
+ *
+ * Resumable: a run that failed part-way left some of the tree behind, and the
+ * retry must finish it rather than copy it all a second time. So whatever the
+ * destination already holds, matched by name and kind, counts as done --
+ * existing files are skipped and existing sub-folders are reused and walked.
+ * Matching is by count, so a template with two files of the same name still
+ * gets both.
  */
 export async function copyFolderContents(
   sourceFolderId: string,
   destFolderId: string
 ): Promise<void> {
-  const children = await listChildren(sourceFolderId);
+  const [children, existing] = await Promise.all([
+    listChildren(sourceFolderId),
+    listChildren(destFolderId),
+  ]);
+  const key = (f: DriveFile) => `${f.mimeType === FOLDER_MIME ? 'd' : 'f'}:${f.name}`;
+  const present = new Map<string, DriveFile[]>();
+  for (const f of existing) present.set(key(f), [...(present.get(key(f)) ?? []), f]);
+
   for (const child of children) {
+    const match = present.get(key(child))?.shift();
     if (child.mimeType === FOLDER_MIME) {
-      const sub = await createFolder(child.name, destFolderId);
-      await copyFolderContents(child.id, sub.id);
-    } else {
+      const subId = match?.id ?? (await createFolder(child.name, destFolderId)).id;
+      await copyFolderContents(child.id, subId);
+    } else if (!match) {
       await copyFile(child.id, child.name, destFolderId);
     }
   }
